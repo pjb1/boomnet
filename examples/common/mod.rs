@@ -28,6 +28,7 @@ pub struct TradeEndpoint {
 }
 
 pub struct TradeBatch<'a> {
+    #[allow(dead_code)]
     id: u32,
     frames: BatchIter<'a, TlsStream<MioStream>>,
 }
@@ -40,6 +41,7 @@ impl Iterator for TradeBatch<'_> {
     }
 }
 
+#[allow(dead_code)]
 pub fn process_batch(batch: TradeBatch<'_>) -> io::Result<()> {
     let id = batch.id;
     for frame in batch {
