@@ -1,9 +1,9 @@
 #[cfg(feature = "ktls")]
 mod deps {
-    pub use boomnet::service::IntoIOService;
     pub use boomnet::service::endpoint::{DisconnectReason, Endpoint};
     pub use boomnet::service::select::Selectable;
     pub use boomnet::service::select::mio::MioSelector;
+    pub use boomnet::service::{IOServiceEvent, IntoIOService};
     pub use boomnet::stream::ktls::{IntoKtlsStream, KtlsStream};
     pub use boomnet::stream::mio::{IntoMioStream, MioStream};
     pub use boomnet::stream::tcp::TcpStream;
@@ -36,18 +36,6 @@ impl TradeConnectionFactory {
 #[cfg(feature = "ktls")]
 struct TradeConnection {
     ws: Websocket<KtlsStream<MioStream>>,
-}
-
-#[cfg(feature = "ktls")]
-impl TradeConnection {
-    fn do_work(&mut self) -> std::io::Result<()> {
-        for frame in self.ws.read_batch()? {
-            if let WebsocketFrame::Text(fin, body) = frame? {
-                println!("({fin}) {}", String::from_utf8_lossy(body));
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(feature = "ktls")]
@@ -90,6 +78,7 @@ impl ConnectionInfoProvider for TradeConnectionFactory {
 #[cfg(feature = "ktls")]
 impl Endpoint for TradeConnectionFactory {
     type Target = TradeConnection;
+    type Event<'a> = boomnet::ws::Batch<'a, KtlsStream<MioStream>>;
 
     fn create_target(&mut self, addr: SocketAddr) -> std::io::Result<Option<Self::Target>> {
         let mut ws = TcpStream::try_from((&self.connection_info, addr))?
@@ -102,7 +91,11 @@ impl Endpoint for TradeConnectionFactory {
         Ok(Some(TradeConnection { ws }))
     }
 
-    fn can_recreate(&mut self, reason: DisconnectReason) -> bool {
+    fn poll<'a>(&'a mut self, target: &'a mut Self::Target) -> std::io::Result<Option<Self::Event<'a>>> {
+        Ok(Some(target.ws.read_batch()?))
+    }
+
+    fn can_recreate(&mut self, reason: &DisconnectReason) -> bool {
         println!("on disconnect: reason={}", reason);
         true
     }
@@ -117,7 +110,13 @@ fn main() -> anyhow::Result<()> {
     io_service.register(TradeConnectionFactory::new())?;
 
     loop {
-        io_service.poll(|conn, _| conn.do_work())?;
+        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
+            for frame in event {
+                if let WebsocketFrame::Text(fin, body) = frame? {
+                    println!("({fin}) {}", String::from_utf8_lossy(body));
+                }
+            }
+        }
     }
 }
 

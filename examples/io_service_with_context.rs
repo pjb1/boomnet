@@ -1,6 +1,6 @@
-use crate::common::{FeedContext, TradeEndpoint};
-use boomnet::service::IntoIOServiceWithContext;
+use crate::common::{FeedContext, TradeEndpoint, process_batch};
 use boomnet::service::select::mio::MioSelector;
+use boomnet::service::{IOServiceEvent, IntoIOServiceWithContext};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -21,6 +21,8 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_xrp)?;
 
     loop {
-        io_service.poll(&mut ctx, |ws, ctx, endpoint| endpoint.poll_ctx(ws, ctx))?;
+        if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut ctx)? {
+            process_batch(event)?;
+        }
     }
 }

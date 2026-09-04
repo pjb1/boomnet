@@ -11,15 +11,27 @@ pub trait Endpoint: ConnectionInfoProvider {
     /// Defines protocol and stream this endpoint operates on.
     type Target;
 
+    /// Event produced while polling the endpoint.
+    type Event<'a>
+    where
+        Self: 'a,
+        Self::Target: 'a;
+
     /// Used by the `IOService` to create connection upon disconnect by passing resolved `addr`.
     /// If the endpoint does not want to connect at this stage it should return `Ok(None)` and
     /// await the next connection attempt with (possibly) different `addr`.
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>>;
 
-    /// Upon disconnection `IOService` will query the endpoint if the connection can be
-    /// recreated, passing the disconnect `reason`. If `false` is returned it will cause
-    /// program to panic.
-    fn can_recreate(&mut self, _reason: DisconnectReason) -> bool {
+    /// Poll the active target for the next available event.
+    ///
+    /// `Ok(None)` means the selected endpoint currently has no event. An error begins the
+    /// disconnect/recreation lifecycle and is passed to [`Endpoint::can_recreate`].
+    fn poll<'a>(&'a mut self, target: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>>;
+
+    /// Upon disconnection `IOService` will query the endpoint if the connection should be
+    /// recreated, passing the disconnect `reason`. Returning `false` makes the service return
+    /// [`crate::service::IOServiceError::EndpointNotRecreatable`].
+    fn can_recreate(&mut self, _reason: &DisconnectReason) -> bool {
         true
     }
 
@@ -41,15 +53,28 @@ pub trait EndpointWithContext<C>: ConnectionInfoProvider {
     /// Defines protocol and stream this endpoint operates on.
     type Target;
 
+    /// Event produced while polling the endpoint.
+    type Event<'a>
+    where
+        Self: 'a,
+        Self::Target: 'a,
+        C: 'a;
+
     /// Used by the `IOService` to create connection upon disconnect passing resolved `addr` and
     /// user provided `Context`. If the endpoint does not want to connect at this stage it should
     /// return `Ok(None)` and await the next connection attempt with (possibly) different `addr`.
     fn create_target(&mut self, addr: SocketAddr, context: &mut C) -> io::Result<Option<Self::Target>>;
 
-    /// Upon disconnection `IOService` will query the endpoint if the connection can be
-    /// recreated, passing the disconnect `reason`. If `false` is returned it will cause
-    /// program to panic.
-    fn can_recreate(&mut self, _reason: DisconnectReason, _context: &mut C) -> bool {
+    /// Poll the active target for the next available event.
+    ///
+    /// `Ok(None)` means the selected endpoint currently has no event. An error begins the
+    /// disconnect/recreation lifecycle and is passed to [`EndpointWithContext::can_recreate`].
+    fn poll<'a>(&'a mut self, target: &'a mut Self::Target, context: &'a mut C) -> io::Result<Option<Self::Event<'a>>>;
+
+    /// Upon disconnection `IOService` will query the endpoint if the connection should be
+    /// recreated, passing the disconnect `reason`. Returning `false` makes the service return
+    /// [`crate::service::IOServiceError::EndpointNotRecreatable`].
+    fn can_recreate(&mut self, _reason: &DisconnectReason, _context: &mut C) -> bool {
         true
     }
 
@@ -62,6 +87,7 @@ pub trait EndpointWithContext<C>: ConnectionInfoProvider {
 }
 
 /// Disconnect reason passed into `can_recreate()` service call.
+#[derive(Debug)]
 pub enum DisconnectReason {
     /// This is expected disconnection due to `ttl` on the connection expiring.
     AutoDisconnect(Duration),
@@ -90,95 +116,5 @@ impl DisconnectReason {
 
     pub(crate) fn other(err: io::Error) -> DisconnectReason {
         DisconnectReason::IO(err)
-    }
-}
-
-#[cfg(all(feature = "ext", feature = "ws", any(feature = "rustls", feature = "openssl")))]
-pub mod ws {
-    use std::io;
-    use std::io::{Read, Write};
-    use std::net::SocketAddr;
-
-    use crate::service::endpoint::{DisconnectReason, Endpoint, EndpointWithContext};
-    use crate::stream::ConnectionInfoProvider;
-    use crate::stream::tls::TlsStream;
-    use crate::ws::Websocket;
-
-    pub type TlsWebsocket<S> = Websocket<TlsStream<S>>;
-
-    pub trait TlsWebsocketEndpoint: ConnectionInfoProvider {
-        type Stream: Read + Write;
-
-        fn create_websocket(&mut self, addr: SocketAddr) -> io::Result<Option<Websocket<TlsStream<Self::Stream>>>>;
-
-        fn can_recreate(&mut self, _reason: DisconnectReason) -> bool {
-            true
-        }
-
-        fn can_auto_disconnect(&mut self) -> bool {
-            true
-        }
-    }
-
-    impl<T> Endpoint for T
-    where
-        T: TlsWebsocketEndpoint,
-    {
-        type Target = Websocket<TlsStream<T::Stream>>;
-
-        #[inline]
-        fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
-            self.create_websocket(addr)
-        }
-
-        #[inline]
-        fn can_recreate(&mut self, reason: DisconnectReason) -> bool {
-            self.can_recreate(reason)
-        }
-
-        #[inline]
-        fn can_auto_disconnect(&mut self) -> bool {
-            self.can_auto_disconnect()
-        }
-    }
-
-    pub trait TlsWebsocketEndpointWithContext<C>: ConnectionInfoProvider {
-        type Stream: Read + Write;
-
-        fn create_websocket(
-            &mut self,
-            addr: SocketAddr,
-            ctx: &mut C,
-        ) -> io::Result<Option<Websocket<TlsStream<Self::Stream>>>>;
-
-        fn can_recreate(&mut self, _reason: DisconnectReason, _ctx: &mut C) -> bool {
-            true
-        }
-
-        fn can_auto_disconnect(&mut self, _ctx: &mut C) -> bool {
-            true
-        }
-    }
-
-    impl<T, C> EndpointWithContext<C> for T
-    where
-        T: TlsWebsocketEndpointWithContext<C>,
-    {
-        type Target = Websocket<TlsStream<T::Stream>>;
-
-        #[inline]
-        fn create_target(&mut self, addr: SocketAddr, context: &mut C) -> io::Result<Option<Self::Target>> {
-            self.create_websocket(addr, context)
-        }
-
-        #[inline]
-        fn can_recreate(&mut self, reason: DisconnectReason, context: &mut C) -> bool {
-            self.can_recreate(reason, context)
-        }
-
-        #[inline]
-        fn can_auto_disconnect(&mut self, context: &mut C) -> bool {
-            self.can_auto_disconnect(context)
-        }
     }
 }

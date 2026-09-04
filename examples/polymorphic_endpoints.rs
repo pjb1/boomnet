@@ -5,10 +5,9 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use boomnet::inet::{IntoNetworkInterface, ToSocketAddr};
-use boomnet::service::endpoint::Context;
-use boomnet::service::endpoint::ws::{TlsWebsocket, TlsWebsocketEndpoint, TlsWebsocketEndpointWithContext};
+use boomnet::service::endpoint::{Context, Endpoint};
 use boomnet::service::select::mio::MioSelector;
-use boomnet::service::{IntoIOService, IntoIOServiceWithContext};
+use boomnet::service::{IOServiceEvent, IntoIOService, IntoIOServiceWithContext};
 use boomnet::stream::mio::{IntoMioStream, MioStream};
 use boomnet::stream::tls::TlsStream;
 use boomnet::stream::{BindAndConnect, ConnectionInfo, ConnectionInfoProvider};
@@ -17,18 +16,14 @@ use idle::IdleStrategy;
 use log::info;
 use url::Url;
 
+enum MarketDataEvent<'a> {
+    Trade(boomnet::ws::Batch<'a, TlsStream<MioStream>>),
+    Ticker(boomnet::ws::Batch<'a, TlsStream<MioStream>>),
+}
+
 enum MarketDataEndpoint {
     Trade(TradeEndpoint),
     Ticker(TickerEndpoint),
-}
-
-impl MarketDataEndpoint {
-    fn poll(&mut self, ws: &mut Websocket<TlsStream<<Self as TlsWebsocketEndpoint>::Stream>>) -> io::Result<()> {
-        match self {
-            MarketDataEndpoint::Ticker(ticker) => ticker.poll(ws),
-            MarketDataEndpoint::Trade(trade) => trade.poll(ws),
-        }
-    }
 }
 
 impl ConnectionInfoProvider for MarketDataEndpoint {
@@ -40,13 +35,21 @@ impl ConnectionInfoProvider for MarketDataEndpoint {
     }
 }
 
-impl TlsWebsocketEndpoint for MarketDataEndpoint {
-    type Stream = MioStream;
+impl Endpoint for MarketDataEndpoint {
+    type Target = Websocket<TlsStream<MioStream>>;
+    type Event<'a> = MarketDataEvent<'a>;
 
-    fn create_websocket(&mut self, addr: SocketAddr) -> io::Result<Option<Websocket<TlsStream<Self::Stream>>>> {
+    fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         match self {
-            MarketDataEndpoint::Ticker(ticker) => ticker.create_websocket(addr),
-            MarketDataEndpoint::Trade(trade) => trade.create_websocket(addr),
+            MarketDataEndpoint::Ticker(ticker) => ticker.create_target(addr),
+            MarketDataEndpoint::Trade(trade) => trade.create_target(addr),
+        }
+    }
+
+    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
+        match self {
+            MarketDataEndpoint::Trade(_) => Ok(Some(MarketDataEvent::Trade(ws.read_batch()?))),
+            MarketDataEndpoint::Ticker(_) => Ok(Some(MarketDataEvent::Ticker(ws.read_batch()?))),
         }
     }
 }
@@ -66,14 +69,6 @@ impl TradeEndpoint {
             instrument,
         }
     }
-
-    #[inline]
-    fn poll(&mut self, ws: &mut TlsWebsocket<<Self as TlsWebsocketEndpoint>::Stream>) -> io::Result<()> {
-        while let Some(Ok(WebsocketFrame::Text(fin, data))) = ws.receive_next() {
-            info!("({fin}) {}", String::from_utf8_lossy(data));
-        }
-        Ok(())
-    }
 }
 
 impl ConnectionInfoProvider for TradeEndpoint {
@@ -82,10 +77,11 @@ impl ConnectionInfoProvider for TradeEndpoint {
     }
 }
 
-impl TlsWebsocketEndpoint for TradeEndpoint {
-    type Stream = MioStream;
+impl Endpoint for TradeEndpoint {
+    type Target = Websocket<TlsStream<MioStream>>;
+    type Event<'a> = boomnet::ws::Batch<'a, TlsStream<MioStream>>;
 
-    fn create_websocket(&mut self, addr: SocketAddr) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = self
             .connection_info
             .clone()
@@ -99,6 +95,10 @@ impl TlsWebsocketEndpoint for TradeEndpoint {
         )?;
 
         Ok(Some(ws))
+    }
+
+    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
+        Ok(Some(ws.read_batch()?))
     }
 }
 
@@ -117,14 +117,6 @@ impl TickerEndpoint {
             instrument,
         }
     }
-
-    #[inline]
-    fn poll(&mut self, ws: &mut TlsWebsocket<<Self as TlsWebsocketEndpoint>::Stream>) -> io::Result<()> {
-        while let Some(Ok(WebsocketFrame::Text(fin, data))) = ws.receive_next() {
-            info!("({fin}) {}", String::from_utf8_lossy(data));
-        }
-        Ok(())
-    }
 }
 
 impl ConnectionInfoProvider for TickerEndpoint {
@@ -133,10 +125,11 @@ impl ConnectionInfoProvider for TickerEndpoint {
     }
 }
 
-impl TlsWebsocketEndpoint for TickerEndpoint {
-    type Stream = MioStream;
+impl Endpoint for TickerEndpoint {
+    type Target = Websocket<TlsStream<MioStream>>;
+    type Event<'a> = boomnet::ws::Batch<'a, TlsStream<MioStream>>;
 
-    fn create_websocket(&mut self, addr: SocketAddr) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = self
             .connection_info
             .clone()
@@ -151,6 +144,10 @@ impl TlsWebsocketEndpoint for TickerEndpoint {
 
         Ok(Some(ws))
     }
+
+    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
+        Ok(Some(ws.read_batch()?))
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -161,10 +158,27 @@ fn main() -> anyhow::Result<()> {
     let ticker = MarketDataEndpoint::Ticker(TickerEndpoint::new(0, "wss://stream.binance.com:443/ws", "btcusdt"));
     let trade = MarketDataEndpoint::Trade(TradeEndpoint::new(1, "wss://stream.binance.com:443/ws", "ethusdt"));
 
-    io_service.register(ticker);
-    io_service.register(trade);
+    io_service.register(ticker)?;
+    io_service.register(trade)?;
 
     loop {
-        io_service.poll(|ws, endpoint| endpoint.poll(ws))?;
+        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
+            match event {
+                MarketDataEvent::Trade(batch) => {
+                    for frame in batch {
+                        if let WebsocketFrame::Text(fin, data) = frame? {
+                            info!("[TRADE] ({fin}) {}", String::from_utf8_lossy(data));
+                        }
+                    }
+                }
+                MarketDataEvent::Ticker(batch) => {
+                    for frame in batch {
+                        if let WebsocketFrame::Text(fin, data) = frame? {
+                            info!("[TICKER] ({fin}) {}", String::from_utf8_lossy(data));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

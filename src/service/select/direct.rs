@@ -1,10 +1,9 @@
-use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
 
 use crate::service::dns::BlockingDnsResolver;
 use crate::service::endpoint::{Context, Endpoint, EndpointWithContext};
-use crate::service::node::IONode;
+use crate::service::node::{IONode, IONodes};
 use crate::service::select::{Selectable, Selector, SelectorToken};
 use crate::service::time::SystemTimeClockSource;
 use crate::service::{IOService, IntoIOService, IntoIOServiceWithContext};
@@ -38,7 +37,7 @@ impl<S: Selectable> Selector for DirectSelector<S> {
         Ok(())
     }
 
-    fn poll<E>(&mut self, _io_nodes: &mut HashMap<SelectorToken, IONode<Self::Target, E>>) -> io::Result<()> {
+    fn poll<E>(&mut self, _io_nodes: &mut IONodes<Self::Target, E>) -> io::Result<()> {
         Ok(())
     }
 

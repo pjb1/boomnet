@@ -1,7 +1,7 @@
-use crate::common::TradeEndpoint;
-use boomnet::service::IntoIOService;
+use crate::common::{TradeEndpoint, process_batch};
 use boomnet::service::dns::AsyncDnsResolver;
 use boomnet::service::select::mio::MioSelector;
+use boomnet::service::{IOServiceEvent, IntoIOService};
 use std::time::Duration;
 
 #[path = "common/mod.rs"]
@@ -24,6 +24,8 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_btc_2)?;
 
     loop {
-        io_service.poll(|ws, endpoint| endpoint.poll(ws))?;
+        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
+            process_batch(event)?;
+        }
     }
 }

@@ -6,7 +6,7 @@
 
 use crate::service::dns::BlockingDnsResolver;
 use crate::service::endpoint::{Context, Endpoint, EndpointWithContext};
-use crate::service::node::IONode;
+use crate::service::node::{IONode, IONodes};
 use crate::service::select::{Selectable, Selector, SelectorToken};
 use crate::service::time::SystemTimeClockSource;
 use crate::service::{IOService, IntoIOService, IntoIOServiceWithContext};
@@ -221,7 +221,7 @@ impl<S: AsRawFd + Selectable> Selector for IoUringSelector<S> {
         Ok(())
     }
 
-    fn poll<E>(&mut self, io_nodes: &mut HashMap<SelectorToken, IONode<Self::Target, E>>) -> io::Result<()> {
+    fn poll<E>(&mut self, io_nodes: &mut IONodes<Self::Target, E>) -> io::Result<()> {
         self.wait()?;
         self.collect_completions();
         self.rearms.clear();
@@ -249,7 +249,7 @@ impl<S: AsRawFd + Selectable> Selector for IoUringSelector<S> {
                 return Err(io::Error::from_raw_os_error(errno));
             }
 
-            let Some(io_node) = io_nodes.get_mut(&token) else {
+            let Some(io_node) = io_nodes.get_mut(token) else {
                 continue;
             };
             match operation {

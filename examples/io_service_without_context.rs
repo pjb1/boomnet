@@ -1,6 +1,6 @@
-use crate::common::TradeEndpoint;
-use boomnet::service::IntoIOService;
+use crate::common::{TradeEndpoint, process_batch};
 use boomnet::service::select::mio::MioSelector;
+use boomnet::service::{IOServiceEvent, IntoIOService};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -19,6 +19,8 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_xrp)?;
 
     loop {
-        io_service.poll(|ws, endpoint| endpoint.poll(ws))?;
+        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
+            process_batch(event)?;
+        }
     }
 }

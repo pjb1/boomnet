@@ -1,6 +1,6 @@
 //! Service to manage multiple endpoint lifecycle.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind;
 use std::marker::PhantomData;
@@ -9,16 +9,20 @@ use std::time::Duration;
 
 use crate::service::dns::{BlockingDnsResolver, DnsQuery, DnsResolver};
 use crate::service::endpoint::{Context, DisconnectReason, Endpoint, EndpointWithContext};
-use crate::service::node::IONode;
+use crate::service::error::IOServiceOperation;
+use crate::service::node::{IONode, IONodes};
 use crate::service::select::{Selector, SelectorToken};
 use crate::service::time::{SystemTimeClockSource, TimeSource};
 use crate::stream::ConnectionInfoProvider;
 
 pub mod dns;
 pub mod endpoint;
+pub mod error;
 mod node;
 pub mod select;
 pub mod time;
+
+pub use error::IOServiceError;
 
 const ENDPOINT_CREATION_THROTTLE_NS: u64 = Duration::from_secs(1).as_nanos() as u64;
 
@@ -32,13 +36,40 @@ pub struct Handle(SelectorToken);
 pub struct IOService<S: Selector, E, C, TS, D: DnsResolver> {
     selector: S,
     pending_endpoints: VecDeque<(Handle, D::Query, u64, E)>,
-    io_nodes: HashMap<SelectorToken, IONode<S::Target, E>>,
+    io_nodes: IONodes<S::Target, E>,
+    pending_disconnects: VecDeque<(Handle, DisconnectReason)>,
     next_endpoint_create_time_ns: u64,
     context: PhantomData<C>,
     auto_disconnect: Option<Box<dyn Fn() -> Duration>>,
     time_source: TS,
     dns_resolver: D,
     dns_query_timeout_ns: Option<u64>,
+}
+
+/// One unit of work produced by [`IOService::poll`].
+#[derive(Debug)]
+pub enum IOServiceEvent<E> {
+    /// An endpoint became active.
+    Connected {
+        /// Connected endpoint handle.
+        handle: Handle,
+    },
+    /// An endpoint disconnected and was scheduled for recreation.
+    Disconnected {
+        /// Disconnected endpoint handle.
+        handle: Handle,
+        /// Cause of the disconnection.
+        reason: DisconnectReason,
+    },
+    /// Data produced by one endpoint.
+    Data {
+        /// Endpoint that produced the data.
+        handle: Handle,
+        /// Endpoint-defined event.
+        event: E,
+    },
+    /// No endpoint produced work during this service poll.
+    Idle,
 }
 
 /// Defines how an instance that implements `SelectService` can be transformed
@@ -65,7 +96,8 @@ impl<S: Selector, E, C, TS, D: DnsResolver> IOService<S, E, C, TS, D> {
         Self {
             selector,
             pending_endpoints: VecDeque::new(),
-            io_nodes: HashMap::new(),
+            io_nodes: IONodes::default(),
+            pending_disconnects: VecDeque::new(),
             next_endpoint_create_time_ns: 0,
             context: PhantomData,
             auto_disconnect: None,
@@ -108,6 +140,7 @@ impl<S: Selector, E, C, TS, D: DnsResolver> IOService<S, E, C, TS, D> {
             context: self.context,
             auto_disconnect: self.auto_disconnect,
             io_nodes: Default::default(),
+            pending_disconnects: Default::default(),
             next_endpoint_create_time_ns: self.next_endpoint_create_time_ns,
             selector: self.selector,
             dns_resolver: self.dns_resolver,
@@ -123,6 +156,7 @@ impl<S: Selector, E, C, TS, D: DnsResolver> IOService<S, E, C, TS, D> {
             context: self.context,
             auto_disconnect: self.auto_disconnect,
             io_nodes: Default::default(),
+            pending_disconnects: Default::default(),
             next_endpoint_create_time_ns: self.next_endpoint_create_time_ns,
             selector: self.selector,
             dns_resolver,
@@ -131,14 +165,17 @@ impl<S: Selector, E, C, TS, D: DnsResolver> IOService<S, E, C, TS, D> {
     }
 
     /// Register a new [`Endpoint`] with the service and return a handle to the created endpoint.
-    pub fn register(&mut self, endpoint: E) -> io::Result<Handle>
+    pub fn register(&mut self, endpoint: E) -> Result<Handle, IOServiceError>
     where
         E: ConnectionInfoProvider,
         TS: TimeSource,
     {
         let handle = Handle(self.selector.next_token());
         let info = endpoint.connection_info();
-        let query = self.dns_resolver.new_query(info.host(), info.port())?;
+        let query = self
+            .dns_resolver
+            .new_query(info.host(), info.port())
+            .map_err(|source| IOServiceError::io(Some(handle), IOServiceOperation::Resolve, source))?;
         let now = self.time_source.current_time_nanos();
         self.pending_endpoints.push_back((handle, query, now, endpoint));
         Ok(handle)
@@ -146,43 +183,55 @@ impl<S: Selector, E, C, TS, D: DnsResolver> IOService<S, E, C, TS, D> {
 
     /// Register a new [`Endpoint`] with the service using provided factory and return a handle to
     /// the created endpoint.
-    pub fn register_with_factory<F>(&mut self, endpoint_factory: F) -> io::Result<Handle>
+    pub fn register_with<F>(&mut self, endpoint_factory: F) -> Result<Handle, IOServiceError>
     where
         E: ConnectionInfoProvider,
         TS: TimeSource,
         F: FnOnce(Handle) -> io::Result<E>,
     {
         let handle = Handle(self.selector.next_token());
-        let endpoint = endpoint_factory(handle)?;
+        let endpoint = endpoint_factory(handle)
+            .map_err(|source| IOServiceError::io(Some(handle), IOServiceOperation::CreateEndpoint, source))?;
         let info = endpoint.connection_info();
-        let query = self.dns_resolver.new_query(info.host(), info.port())?;
+        let query = self
+            .dns_resolver
+            .new_query(info.host(), info.port())
+            .map_err(|source| IOServiceError::io(Some(handle), IOServiceOperation::Resolve, source))?;
         let now = self.time_source.current_time_nanos();
         self.pending_endpoints.push_back((handle, query, now, endpoint));
         Ok(handle)
     }
 
     /// Deregister [`Endpoint`] with the service based on a handle.
-    pub fn deregister(&mut self, handle: Handle) -> Option<E> {
-        match self.io_nodes.remove(&handle.0) {
-            Some(mut io_node) => {
-                self.selector.unregister(&mut io_node).unwrap();
-                Some(io_node.into_endpoint().1)
+    pub fn deregister(&mut self, handle: Handle) -> Result<Option<E>, IOServiceError> {
+        self.pending_disconnects
+            .retain(|(pending_handle, _)| *pending_handle != handle);
+        if let Some(io_node) = self.io_nodes.get_mut(handle.0) {
+            self.selector
+                .unregister(io_node)
+                .map_err(|source| IOServiceError::io(Some(handle), IOServiceOperation::Unregister, source))?;
+            match self.io_nodes.remove(handle.0) {
+                Some(io_node) => Ok(Some(io_node.into_endpoint().1)),
+                None => Err(IOServiceError::InvalidState {
+                    handle: Some(handle),
+                    message: "endpoint disappeared after selector unregistration",
+                }),
             }
-            None => {
-                let mut index_to_remove = None;
-                for (index, endpoint) in self.pending_endpoints.iter().enumerate() {
-                    if endpoint.0 == handle {
-                        index_to_remove = Some(index);
-                        break;
-                    }
+        } else {
+            let mut index_to_remove = None;
+            for (index, endpoint) in self.pending_endpoints.iter().enumerate() {
+                if endpoint.0 == handle {
+                    index_to_remove = Some(index);
+                    break;
                 }
-                if let Some(index_to_remove) = index_to_remove {
-                    self.pending_endpoints
-                        .remove(index_to_remove)
-                        .map(|(_, _, _, endpoint)| endpoint)
-                } else {
-                    None
-                }
+            }
+            if let Some(index_to_remove) = index_to_remove {
+                Ok(self
+                    .pending_endpoints
+                    .remove(index_to_remove)
+                    .map(|(_, _, _, endpoint)| endpoint))
+            } else {
+                Ok(None)
             }
         }
     }
@@ -239,7 +288,7 @@ impl<S: Selector, E, C, TS, D: DnsResolver> IOService<S, E, C, TS, D> {
     }
 
     #[cold]
-    fn check_pending_endpoints<F>(&mut self, create_target: F) -> io::Result<()>
+    fn check_pending_endpoints<F>(&mut self, create_target: F) -> Result<Option<Handle>, IOServiceError>
     where
         E: ConnectionInfoProvider,
         TS: TimeSource,
@@ -248,18 +297,37 @@ impl<S: Selector, E, C, TS, D: DnsResolver> IOService<S, E, C, TS, D> {
         let current_time_ns = self.time_source.current_time_nanos();
         if current_time_ns > self.next_endpoint_create_time_ns {
             if let Some((handle, mut query, query_time_ns, mut endpoint)) = self.pending_endpoints.pop_front() {
-                if let Some(addr) = self.resolve_dns(&mut query, query_time_ns)? {
-                    match create_target(&mut endpoint, addr)? {
+                if let Some(addr) = self
+                    .resolve_dns(&mut query, query_time_ns)
+                    .map_err(|source| IOServiceError::io(Some(handle), IOServiceOperation::Resolve, source))?
+                {
+                    match create_target(&mut endpoint, addr)
+                        .map_err(|source| IOServiceError::io(Some(handle), IOServiceOperation::CreateTarget, source))?
+                    {
                         Some(stream) => {
                             let ttl = self.auto_disconnect.as_ref().map(|auto_disconnect| auto_disconnect());
-                            let mut io_node = IONode::new(stream, handle, endpoint, ttl, &self.time_source, addr);
-                            self.selector.register(handle.0, &mut io_node)?;
-                            self.io_nodes.insert(handle.0, io_node);
+                            let mut io_node = IONode::new(stream, handle, endpoint, ttl, &self.time_source);
+                            self.selector.register(handle.0, &mut io_node).map_err(|source| {
+                                IOServiceError::io(Some(handle), IOServiceOperation::Register, source)
+                            })?;
+                            self.io_nodes
+                                .insert(handle.0, io_node)
+                                .map_err(|_| IOServiceError::InvalidState {
+                                    handle: Some(handle),
+                                    message: "endpoint token is already active",
+                                })?;
+                            self.next_endpoint_create_time_ns = current_time_ns + ENDPOINT_CREATION_THROTTLE_NS;
+                            return Ok(Some(handle));
                         }
                         None => {
                             // request new dns query
                             let info = endpoint.connection_info();
-                            let query = self.dns_resolver.new_query(info.host(), info.port())?;
+                            let query = self
+                                .dns_resolver
+                                .new_query(info.host(), info.port())
+                                .map_err(|source| {
+                                    IOServiceError::io(Some(handle), IOServiceOperation::Resolve, source)
+                                })?;
                             let now = self.time_source.current_time_nanos();
                             self.pending_endpoints.push_back((handle, query, now, endpoint))
                         }
@@ -271,6 +339,41 @@ impl<S: Selector, E, C, TS, D: DnsResolver> IOService<S, E, C, TS, D> {
             }
             self.next_endpoint_create_time_ns = current_time_ns + ENDPOINT_CREATION_THROTTLE_NS;
         }
+        Ok(None)
+    }
+
+    #[inline]
+    fn next_active_handle(&mut self) -> Option<Handle> {
+        self.io_nodes.next_active_token().map(Handle)
+    }
+
+    fn remove_active_endpoint(&mut self, handle: Handle) -> Result<E, IOServiceError> {
+        let io_node = self.io_nodes.get_mut(handle.0).ok_or(IOServiceError::InvalidState {
+            handle: Some(handle),
+            message: "active endpoint is not registered",
+        })?;
+        self.selector
+            .unregister(io_node)
+            .map_err(|source| IOServiceError::io(Some(handle), IOServiceOperation::Unregister, source))?;
+        let io_node = self.io_nodes.remove(handle.0).ok_or(IOServiceError::InvalidState {
+            handle: Some(handle),
+            message: "endpoint disappeared after selector unregistration",
+        })?;
+        Ok(io_node.into_endpoint().1)
+    }
+
+    fn schedule_reconnect(&mut self, handle: Handle, endpoint: E) -> Result<(), IOServiceError>
+    where
+        E: ConnectionInfoProvider,
+        TS: TimeSource,
+    {
+        let info = endpoint.connection_info();
+        let query = self
+            .dns_resolver
+            .new_query(info.host(), info.port())
+            .map_err(|source| IOServiceError::io(Some(handle), IOServiceOperation::Resolve, source))?;
+        let now = self.time_source.current_time_nanos();
+        self.pending_endpoints.push_back((handle, query, now, endpoint));
         Ok(())
     }
 }
@@ -282,73 +385,105 @@ where
     TS: TimeSource,
     D: DnsResolver,
 {
-    /// This method polls all registered endpoints for readiness and performs I/O operations based
-    /// on the ['Selector'] poll results. It then iterates through all endpoints, either
-    /// updating existing streams or creating and registering new ones. If there's pending IO on the stream,
-    /// the provided `action` closure will be invoked. It uses [`Endpoint::can_recreate`]
-    /// to determine if the error that occurred during polling is recoverable (typically due to remote peer disconnect).
-    pub fn poll<F>(&mut self, mut action: F) -> io::Result<()>
-    where
-        F: FnMut(&mut E::Target, &mut E) -> io::Result<()>,
-    {
-        // check for pending endpoints (one at a time & throttled)
-        if !self.pending_endpoints.is_empty() {
-            self.check_pending_endpoints(|endpoint, addr| endpoint.create_target(addr))?;
-        }
-
-        // check for readiness events
-        self.selector.poll(&mut self.io_nodes)?;
-
-        // check for auto disconnect if enabled
-        if let Some(auto_disconnect) = self.auto_disconnect.as_ref() {
-            let current_time_ns = self.time_source.current_time_nanos();
-            self.io_nodes.retain(|_token, io_node| {
-                let force_disconnect = current_time_ns > io_node.disconnect_time_ns;
-                if force_disconnect {
-                    // check if we really have to disconnect
-                    return if io_node.as_endpoint_mut().1.can_auto_disconnect() {
-                        self.selector.unregister(io_node).unwrap();
-                        let (handle, mut endpoint) = io_node.endpoint.take().unwrap();
-                        if endpoint.can_recreate(DisconnectReason::auto_disconnect(io_node.ttl)) {
-                            let info = endpoint.connection_info();
-                            let query = self.dns_resolver.new_query(info.host(), info.port()).unwrap();
-                            let now = self.time_source.current_time_nanos();
-                            self.pending_endpoints.push_back((handle, query, now, endpoint));
-                        } else {
-                            panic!("unrecoverable error when polling endpoint");
-                        }
-                        false
-                    } else {
-                        // extend the endpoint TTL
-                        let extend = auto_disconnect().as_nanos() as u64;
-                        io_node.disconnect_time_ns = io_node.disconnect_time_ns.saturating_add(extend);
-                        true
-                    };
-                }
-                true
-            });
-        }
-
-        // poll endpoints
-        self.io_nodes.retain(|_token, io_node| {
-            let (target, (_, endpoint)) = io_node.as_parts_mut();
-            if let Err(err) = action(target, endpoint) {
-                self.selector.unregister(io_node).unwrap();
-                let (handle, mut endpoint) = io_node.endpoint.take().unwrap();
-                if endpoint.can_recreate(DisconnectReason::other(err)) {
-                    let info = endpoint.connection_info();
-                    let query = self.dns_resolver.new_query(info.host(), info.port()).unwrap();
-                    let now = self.time_source.current_time_nanos();
-                    self.pending_endpoints.push_back((handle, query, now, endpoint));
-                } else {
-                    panic!("unrecoverable error when polling endpoint");
-                }
-                return false;
+    /// Advance the service once and return at most one fair unit of endpoint work.
+    ///
+    /// Active endpoints are selected in persistent round-robin order. The returned event may
+    /// borrow its endpoint target and therefore must be dropped before polling the service again.
+    pub fn poll(&mut self) -> Result<IOServiceEvent<E::Event<'_>>, IOServiceError> {
+        if let Some((handle, reason)) = self.pending_disconnects.pop_front() {
+            let can_recreate = self
+                .io_nodes
+                .get_mut(handle.0)
+                .ok_or(IOServiceError::InvalidState {
+                    handle: Some(handle),
+                    message: "disconnected endpoint is not registered",
+                })?
+                .as_endpoint_mut()
+                .1
+                .can_recreate(&reason);
+            let endpoint = self.remove_active_endpoint(handle)?;
+            if !can_recreate {
+                return Err(IOServiceError::EndpointNotRecreatable { handle, reason });
             }
-            true
-        });
+            self.schedule_reconnect(handle, endpoint)?;
+            return Ok(IOServiceEvent::Disconnected { handle, reason });
+        }
 
-        Ok(())
+        if !self.pending_endpoints.is_empty()
+            && let Some(handle) = self.check_pending_endpoints(|endpoint, addr| endpoint.create_target(addr))?
+        {
+            return Ok(IOServiceEvent::Connected { handle });
+        }
+
+        self.selector
+            .poll(&mut self.io_nodes)
+            .map_err(|source| IOServiceError::io(None, IOServiceOperation::PollSelector, source))?;
+
+        let Some(handle) = self.next_active_handle() else {
+            return Ok(IOServiceEvent::Idle);
+        };
+
+        let auto_disconnect = self.auto_disconnect.as_ref();
+        if let Some(auto_disconnect) = auto_disconnect {
+            let current_time_ns = self.time_source.current_time_nanos();
+            let force_disconnect = self
+                .io_nodes
+                .get(handle.0)
+                .is_some_and(|node| current_time_ns > node.disconnect_time_ns);
+            if force_disconnect {
+                let can_auto_disconnect = self
+                    .io_nodes
+                    .get_mut(handle.0)
+                    .ok_or(IOServiceError::InvalidState {
+                        handle: Some(handle),
+                        message: "active endpoint is not registered",
+                    })?
+                    .as_endpoint_mut()
+                    .1
+                    .can_auto_disconnect();
+                if can_auto_disconnect {
+                    let node = self.io_nodes.get_mut(handle.0).ok_or(IOServiceError::InvalidState {
+                        handle: Some(handle),
+                        message: "active endpoint is not registered",
+                    })?;
+                    let ttl = node.ttl;
+                    let reason = DisconnectReason::auto_disconnect(ttl);
+                    let can_recreate = node.as_endpoint_mut().1.can_recreate(&reason);
+                    let endpoint = self.remove_active_endpoint(handle)?;
+                    if !can_recreate {
+                        return Err(IOServiceError::EndpointNotRecreatable { handle, reason });
+                    }
+                    self.schedule_reconnect(handle, endpoint)?;
+                    return Ok(IOServiceEvent::Disconnected { handle, reason });
+                }
+
+                let extend = auto_disconnect().as_nanos() as u64;
+                let node = self.io_nodes.get_mut(handle.0).ok_or(IOServiceError::InvalidState {
+                    handle: Some(handle),
+                    message: "active endpoint is not registered",
+                })?;
+                node.disconnect_time_ns = node.disconnect_time_ns.saturating_add(extend);
+            }
+        }
+
+        let (io_nodes, pending_disconnects) = (&mut self.io_nodes, &mut self.pending_disconnects);
+        let result = {
+            let node = io_nodes.get_mut(handle.0).ok_or(IOServiceError::InvalidState {
+                handle: Some(handle),
+                message: "active endpoint is not registered",
+            })?;
+            let (target, (_, endpoint)) = node.as_parts_mut();
+            endpoint.poll(target)
+        };
+
+        match result {
+            Ok(Some(event)) => Ok(IOServiceEvent::Data { handle, event }),
+            Ok(None) => Ok(IOServiceEvent::Idle),
+            Err(source) => {
+                pending_disconnects.push_back((handle, DisconnectReason::other(source)));
+                Ok(IOServiceEvent::Idle)
+            }
+        }
     }
 
     /// Dispatch command to an active endpoint using `handle` and provided `action`. If the
@@ -358,7 +493,7 @@ where
     where
         F: FnMut(&mut E::Target, &mut E) -> std::io::Result<T>,
     {
-        match self.io_nodes.get_mut(&handle.0) {
+        match self.io_nodes.get_mut(handle.0) {
             Some(io_node) => {
                 let (stream, (_, endpoint)) = io_node.as_parts_mut();
                 let result = action(stream, endpoint)?;
@@ -377,73 +512,105 @@ where
     TS: TimeSource,
     D: DnsResolver,
 {
-    /// This method polls all registered endpoints for readiness passing the [`Context`] and performs I/O operations based
-    /// on the `SelectService` poll results. It then iterates through all endpoints, either
-    /// updating existing streams or creating and registering new ones. If there's pending IO on the stream,
-    /// the provided `action` closure will be invoked. It uses [`Endpoint::can_recreate`]
-    /// to determine if the error that occurred during polling is recoverable (typically due to remote peer disconnect).
-    pub fn poll<F>(&mut self, ctx: &mut C, mut action: F) -> io::Result<()>
-    where
-        F: FnMut(&mut E::Target, &mut C, &mut E) -> io::Result<()>,
-    {
-        // check for pending endpoints (one at a time & throttled)
-        if !self.pending_endpoints.is_empty() {
-            self.check_pending_endpoints(|endpoint, addr| endpoint.create_target(addr, ctx))?;
-        }
-
-        // check for readiness events
-        self.selector.poll(&mut self.io_nodes)?;
-
-        // check for auto disconnect if enabled
-        if let Some(auto_disconnect) = self.auto_disconnect.as_ref() {
-            let current_time_ns = self.time_source.current_time_nanos();
-            self.io_nodes.retain(|_token, io_node| {
-                let force_disconnect = current_time_ns > io_node.disconnect_time_ns;
-                if force_disconnect {
-                    // check if we really have to disconnect
-                    return if io_node.as_endpoint_mut().1.can_auto_disconnect(ctx) {
-                        self.selector.unregister(io_node).unwrap();
-                        let (handle, mut endpoint) = io_node.endpoint.take().unwrap();
-                        if endpoint.can_recreate(DisconnectReason::auto_disconnect(io_node.ttl), ctx) {
-                            let info = endpoint.connection_info();
-                            let query = self.dns_resolver.new_query(info.host(), info.port()).unwrap();
-                            let now = self.time_source.current_time_nanos();
-                            self.pending_endpoints.push_back((handle, query, now, endpoint));
-                        } else {
-                            panic!("unrecoverable error when polling endpoint");
-                        }
-                        false
-                    } else {
-                        // extend the endpoint TTL
-                        let extend = auto_disconnect().as_nanos() as u64;
-                        io_node.disconnect_time_ns = io_node.disconnect_time_ns.saturating_add(extend);
-                        true
-                    };
-                }
-                true
-            });
-        }
-
-        // poll endpoints
-        self.io_nodes.retain(|_token, io_node| {
-            let (target, (_, endpoint)) = io_node.as_parts_mut();
-            if let Err(err) = action(target, ctx, endpoint) {
-                self.selector.unregister(io_node).unwrap();
-                let (handle, mut endpoint) = io_node.endpoint.take().unwrap();
-                if endpoint.can_recreate(DisconnectReason::other(err), ctx) {
-                    let info = endpoint.connection_info();
-                    let query = self.dns_resolver.new_query(info.host(), info.port()).unwrap();
-                    let now = self.time_source.current_time_nanos();
-                    self.pending_endpoints.push_back((handle, query, now, endpoint));
-                } else {
-                    panic!("unrecoverable error when polling endpoint");
-                }
-                return false;
+    /// Advance the service once and return at most one fair unit of endpoint work.
+    ///
+    /// Active endpoints are selected in persistent round-robin order. The returned event may
+    /// borrow its endpoint target or context and therefore must be dropped before polling again.
+    pub fn poll<'a>(&'a mut self, ctx: &'a mut C) -> Result<IOServiceEvent<E::Event<'a>>, IOServiceError> {
+        if let Some((handle, reason)) = self.pending_disconnects.pop_front() {
+            let can_recreate = self
+                .io_nodes
+                .get_mut(handle.0)
+                .ok_or(IOServiceError::InvalidState {
+                    handle: Some(handle),
+                    message: "disconnected endpoint is not registered",
+                })?
+                .as_endpoint_mut()
+                .1
+                .can_recreate(&reason, ctx);
+            let endpoint = self.remove_active_endpoint(handle)?;
+            if !can_recreate {
+                return Err(IOServiceError::EndpointNotRecreatable { handle, reason });
             }
-            true
-        });
+            self.schedule_reconnect(handle, endpoint)?;
+            return Ok(IOServiceEvent::Disconnected { handle, reason });
+        }
 
-        Ok(())
+        if !self.pending_endpoints.is_empty()
+            && let Some(handle) = self.check_pending_endpoints(|endpoint, addr| endpoint.create_target(addr, ctx))?
+        {
+            return Ok(IOServiceEvent::Connected { handle });
+        }
+
+        self.selector
+            .poll(&mut self.io_nodes)
+            .map_err(|source| IOServiceError::io(None, IOServiceOperation::PollSelector, source))?;
+
+        let Some(handle) = self.next_active_handle() else {
+            return Ok(IOServiceEvent::Idle);
+        };
+
+        let auto_disconnect = self.auto_disconnect.as_ref();
+        if let Some(auto_disconnect) = auto_disconnect {
+            let current_time_ns = self.time_source.current_time_nanos();
+            let force_disconnect = self
+                .io_nodes
+                .get(handle.0)
+                .is_some_and(|node| current_time_ns > node.disconnect_time_ns);
+            if force_disconnect {
+                let can_auto_disconnect = self
+                    .io_nodes
+                    .get_mut(handle.0)
+                    .ok_or(IOServiceError::InvalidState {
+                        handle: Some(handle),
+                        message: "active endpoint is not registered",
+                    })?
+                    .as_endpoint_mut()
+                    .1
+                    .can_auto_disconnect(ctx);
+                if can_auto_disconnect {
+                    let node = self.io_nodes.get_mut(handle.0).ok_or(IOServiceError::InvalidState {
+                        handle: Some(handle),
+                        message: "active endpoint is not registered",
+                    })?;
+                    let ttl = node.ttl;
+                    let reason = DisconnectReason::auto_disconnect(ttl);
+                    let can_recreate = node.as_endpoint_mut().1.can_recreate(&reason, ctx);
+                    let endpoint = self.remove_active_endpoint(handle)?;
+                    if !can_recreate {
+                        return Err(IOServiceError::EndpointNotRecreatable { handle, reason });
+                    }
+                    self.schedule_reconnect(handle, endpoint)?;
+                    return Ok(IOServiceEvent::Disconnected { handle, reason });
+                }
+
+                let extend = auto_disconnect().as_nanos() as u64;
+                let node = self.io_nodes.get_mut(handle.0).ok_or(IOServiceError::InvalidState {
+                    handle: Some(handle),
+                    message: "active endpoint is not registered",
+                })?;
+                node.disconnect_time_ns = node.disconnect_time_ns.saturating_add(extend);
+            }
+        }
+
+        let (io_nodes, pending_disconnects) = (&mut self.io_nodes, &mut self.pending_disconnects);
+        let result = {
+            let node = io_nodes.get_mut(handle.0).ok_or(IOServiceError::InvalidState {
+                handle: Some(handle),
+                message: "active endpoint is not registered",
+            })?;
+            let (target, (_, endpoint)) = node.as_parts_mut();
+            endpoint.poll(target, ctx)
+        };
+
+        match result {
+            Ok(Some(event)) => Ok(IOServiceEvent::Data { handle, event }),
+            Ok(None) => Ok(IOServiceEvent::Idle),
+            Err(source) => {
+                pending_disconnects.push_back((handle, DisconnectReason::other(source)));
+                Ok(IOServiceEvent::Idle)
+            }
+        }
     }
 
     /// Dispatch command to an active endpoint using `handle` and provided `action`. If the
@@ -454,7 +621,7 @@ where
     where
         F: FnMut(&mut E::Target, &mut E, &mut C) -> std::io::Result<T>,
     {
-        match self.io_nodes.get_mut(&handle.0) {
+        match self.io_nodes.get_mut(handle.0) {
             Some(io_node) => {
                 let (stream, (_, endpoint)) = io_node.as_parts_mut();
                 let result = action(stream, endpoint, ctx)?;
@@ -462,5 +629,223 @@ where
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::dns::{DnsQuery, DnsResolver};
+    use crate::service::select::Selectable;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct TestTarget;
+
+    impl Selectable for TestTarget {
+        fn connected(&mut self) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn make_writable(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn make_readable(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestSelector {
+        next_token: SelectorToken,
+    }
+
+    impl Selector for TestSelector {
+        type Target = TestTarget;
+
+        fn register<E>(&mut self, _token: SelectorToken, _node: &mut IONode<Self::Target, E>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn unregister<E>(&mut self, _node: &mut IONode<Self::Target, E>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn poll<E>(&mut self, _nodes: &mut IONodes<Self::Target, E>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn next_token(&mut self) -> SelectorToken {
+            let token = self.next_token;
+            self.next_token += 1;
+            token
+        }
+    }
+
+    struct FixedDns;
+    struct FixedQuery;
+
+    impl DnsResolver for FixedDns {
+        type Query = FixedQuery;
+
+        fn new_query(&self, _host: impl AsRef<str>, _port: u16) -> io::Result<Self::Query> {
+            Ok(FixedQuery)
+        }
+    }
+
+    impl DnsQuery for FixedQuery {
+        fn poll(&mut self) -> io::Result<impl IntoIterator<Item = SocketAddr>> {
+            Ok([SocketAddr::from(([127, 0, 0, 1], 1234))])
+        }
+    }
+
+    #[derive(Clone)]
+    struct ManualTime(Rc<Cell<u64>>);
+
+    impl TimeSource for ManualTime {
+        fn current_time_nanos(&self) -> u64 {
+            self.0.get()
+        }
+    }
+
+    struct TestEndpoint {
+        id: u32,
+        connection_info: crate::stream::ConnectionInfo,
+        fail_poll: bool,
+        recreate: bool,
+    }
+
+    impl TestEndpoint {
+        fn new(id: u32) -> Self {
+            Self {
+                id,
+                connection_info: crate::stream::ConnectionInfo::new("localhost", 1234),
+                fail_poll: false,
+                recreate: true,
+            }
+        }
+
+        fn terminal(id: u32) -> Self {
+            Self {
+                fail_poll: true,
+                recreate: false,
+                ..Self::new(id)
+            }
+        }
+    }
+
+    impl ConnectionInfoProvider for TestEndpoint {
+        fn connection_info(&self) -> &crate::stream::ConnectionInfo {
+            &self.connection_info
+        }
+    }
+
+    impl Endpoint for TestEndpoint {
+        type Target = TestTarget;
+        type Event<'a> = u32;
+
+        fn create_target(&mut self, _addr: SocketAddr) -> io::Result<Option<Self::Target>> {
+            Ok(Some(TestTarget))
+        }
+
+        fn poll<'a>(&'a mut self, _target: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
+            if self.fail_poll {
+                Err(io::Error::new(ErrorKind::ConnectionReset, "test disconnect"))
+            } else {
+                Ok(Some(self.id))
+            }
+        }
+
+        fn can_recreate(&mut self, _reason: &DisconnectReason) -> bool {
+            self.recreate
+        }
+    }
+
+    fn service(time: ManualTime) -> IOService<TestSelector, TestEndpoint, (), ManualTime, FixedDns> {
+        IOService::new(TestSelector::default(), time, FixedDns)
+    }
+
+    fn connect_next(
+        service: &mut IOService<TestSelector, TestEndpoint, (), ManualTime, FixedDns>,
+        now: &Rc<Cell<u64>>,
+        time_ns: u64,
+    ) {
+        now.set(time_ns);
+        assert!(matches!(service.poll().unwrap(), IOServiceEvent::Connected { .. }));
+    }
+
+    #[test]
+    fn polls_active_endpoints_in_round_robin_order() {
+        let now = Rc::new(Cell::new(1));
+        let mut service = service(ManualTime(now.clone()));
+        for id in 0..3 {
+            service.register(TestEndpoint::new(id)).unwrap();
+        }
+
+        connect_next(&mut service, &now, 1);
+        connect_next(&mut service, &now, 1_000_000_002);
+        connect_next(&mut service, &now, 2_000_000_003);
+
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            match service.poll().unwrap() {
+                IOServiceEvent::Data { event, .. } => events.push(event),
+                _ => panic!("expected a batch"),
+            }
+        }
+        assert_eq!(events, [0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn round_robin_skips_deregistered_slots() {
+        let now = Rc::new(Cell::new(1));
+        let mut service = service(ManualTime(now.clone()));
+        let handles = (0..3)
+            .map(|id| service.register(TestEndpoint::new(id)).unwrap())
+            .collect::<Vec<_>>();
+
+        connect_next(&mut service, &now, 1);
+        connect_next(&mut service, &now, 1_000_000_002);
+        connect_next(&mut service, &now, 2_000_000_003);
+
+        assert!(matches!(service.poll().unwrap(), IOServiceEvent::Data { event: 0, .. }));
+        service.deregister(handles[1]).unwrap();
+        assert!(matches!(service.poll().unwrap(), IOServiceEvent::Data { event: 2, .. }));
+        assert!(matches!(service.poll().unwrap(), IOServiceEvent::Data { event: 0, .. }));
+    }
+
+    #[test]
+    fn returns_error_when_disconnected_endpoint_declines_recreation() {
+        let now = Rc::new(Cell::new(1));
+        let mut service = service(ManualTime(now.clone()));
+        let handle = service.register(TestEndpoint::terminal(7)).unwrap();
+        connect_next(&mut service, &now, 1);
+
+        assert!(matches!(service.poll().unwrap(), IOServiceEvent::Idle));
+        let error = service.poll().unwrap_err();
+        match error {
+            IOServiceError::EndpointNotRecreatable {
+                handle: error_handle,
+                reason: DisconnectReason::IO(source),
+            } => {
+                assert_eq!(error_handle, handle);
+                assert_eq!(source.kind(), ErrorKind::ConnectionReset);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(service.iter().count(), 0);
+    }
+
+    #[test]
+    fn deregister_clears_a_queued_disconnect() {
+        let now = Rc::new(Cell::new(1));
+        let mut service = service(ManualTime(now.clone()));
+        let handle = service.register(TestEndpoint::terminal(7)).unwrap();
+        connect_next(&mut service, &now, 1);
+
+        assert!(matches!(service.poll().unwrap(), IOServiceEvent::Idle));
+        assert!(service.deregister(handle).unwrap().is_some());
+        assert!(matches!(service.poll().unwrap(), IOServiceEvent::Idle));
     }
 }

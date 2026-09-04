@@ -1,22 +1,27 @@
 use boomnet::inet::{IntoNetworkInterface, ToSocketAddr};
-use boomnet::service::IntoIOService;
-use boomnet::service::endpoint::ws::{TlsWebsocket, TlsWebsocketEndpoint};
+use boomnet::service::endpoint::Endpoint;
 use boomnet::service::select::direct::DirectSelector;
+use boomnet::service::{IOServiceEvent, IntoIOService};
+use boomnet::stream::tls::TlsStream;
 use boomnet::stream::{ConnectionInfo, ConnectionInfoProvider, tcp};
-use boomnet::ws::{IntoTlsWebsocket, WebsocketFrame};
+use boomnet::ws::{Batch, IntoTlsWebsocket, Websocket, WebsocketFrame};
 use std::io;
 use std::net::SocketAddr;
 use url::Url;
 
 struct TradeEndpoint {
-    id: u32,
     connection_info: ConnectionInfo,
     instrument: &'static str,
     ws_endpoint: String,
 }
 
 impl TradeEndpoint {
-    pub fn new(id: u32, url: &'static str, net_iface: Option<&'static str>, instrument: &'static str) -> TradeEndpoint {
+    pub fn new(
+        _id: u32,
+        url: &'static str,
+        net_iface: Option<&'static str>,
+        instrument: &'static str,
+    ) -> TradeEndpoint {
         let url = Url::parse(url).unwrap();
         let mut connection_info = ConnectionInfo::try_from(url.clone()).unwrap();
         let ws_endpoint = url.path().to_owned();
@@ -27,21 +32,10 @@ impl TradeEndpoint {
             connection_info = connection_info.with_net_iface(net_iface);
         }
         Self {
-            id,
             connection_info,
             instrument,
             ws_endpoint,
         }
-    }
-
-    #[inline]
-    fn poll(&mut self, ws: &mut TlsWebsocket<<Self as TlsWebsocketEndpoint>::Stream>) -> io::Result<()> {
-        for frame in ws.read_batch()? {
-            if let WebsocketFrame::Text(fin, data) = frame? {
-                println!("[{}] ({fin}) {}", self.id, String::from_utf8_lossy(data))
-            }
-        }
-        Ok(())
     }
 }
 
@@ -51,10 +45,11 @@ impl ConnectionInfoProvider for TradeEndpoint {
     }
 }
 
-impl TlsWebsocketEndpoint for TradeEndpoint {
-    type Stream = tcp::TcpStream;
+impl Endpoint for TradeEndpoint {
+    type Target = Websocket<TlsStream<tcp::TcpStream>>;
+    type Event<'a> = Batch<'a, TlsStream<tcp::TcpStream>>;
 
-    fn create_websocket(&mut self, addr: SocketAddr) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = self
             .connection_info
             .clone()
@@ -66,6 +61,10 @@ impl TlsWebsocketEndpoint for TradeEndpoint {
         )?;
 
         Ok(Some(ws))
+    }
+
+    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
+        Ok(Some(ws.read_batch()?))
     }
 }
 
@@ -83,6 +82,12 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_xrp)?;
 
     loop {
-        io_service.poll(|ws, endpoint| endpoint.poll(ws))?;
+        if let IOServiceEvent::Data { handle, event } = io_service.poll()? {
+            for frame in event {
+                if let WebsocketFrame::Text(fin, data) = frame? {
+                    println!("[{handle:?}] ({fin}) {}", String::from_utf8_lossy(data));
+                }
+            }
+        }
     }
 }

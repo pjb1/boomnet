@@ -24,7 +24,6 @@ openssl = ["dep:openssl", "dep:openssl-probe", "dep:openssl-sys"]
 ktls = ["openssl", "dep:foreign-types", "dep:openssl-src"]
 http = ["dep:http", "httparse", "memchr", "dep:itoa"]
 ws = ["rand", "base64", "dep:http", "httparse"]
-ext = []
 c-ares = ["dep:c-ares", "dep:itoa", "dep:polling"]
 
 [dependencies]
@@ -93,4 +92,4 @@ harness = false
 
 [[example]]
 name = "io_service_with_io_uring_selector"
-required-features = ["io-uring", "openssl", "ws", "ext"]
+required-features = ["io-uring", "openssl", "ws"]

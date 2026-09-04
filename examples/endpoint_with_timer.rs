@@ -2,13 +2,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use boomnet::service::IntoIOServiceWithContext;
-use boomnet::service::endpoint::Context;
-use boomnet::service::endpoint::ws::{TlsWebsocket, TlsWebsocketEndpointWithContext};
+use boomnet::service::endpoint::{Context, EndpointWithContext};
 use boomnet::service::select::mio::MioSelector;
+use boomnet::service::{IOServiceEvent, IntoIOServiceWithContext};
 use boomnet::stream::mio::{IntoMioStream, MioStream};
+use boomnet::stream::tls::TlsStream;
 use boomnet::stream::{ConnectionInfo, ConnectionInfoProvider};
-use boomnet::ws::{IntoTlsWebsocket, WebsocketFrame};
+use boomnet::ws::{Batch, IntoTlsWebsocket, Websocket, WebsocketFrame};
 use log::info;
 use url::Url;
 
@@ -29,23 +29,6 @@ impl TradeEndpoint {
             instrument,
             next_disconnect_time_ns: ctx.current_time_ns() + Duration::from_secs(10).as_nanos() as u64,
         }
-    }
-
-    #[inline]
-    fn poll(
-        &mut self,
-        ws: &mut TlsWebsocket<<Self as TlsWebsocketEndpointWithContext<FeedContext>>::Stream>,
-        ctx: &mut FeedContext,
-    ) -> io::Result<()> {
-        while let Some(Ok(WebsocketFrame::Text(fin, data))) = ws.receive_next() {
-            info!("({fin}) {}", String::from_utf8_lossy(data));
-        }
-        let now_ns = ctx.current_time_ns();
-        if now_ns > self.next_disconnect_time_ns {
-            self.next_disconnect_time_ns = now_ns + Duration::from_secs(10).as_nanos() as u64;
-            return Err(io::Error::other("disconnected due to timer"));
-        }
-        Ok(())
     }
 }
 
@@ -70,14 +53,11 @@ impl ConnectionInfoProvider for TradeEndpoint {
     }
 }
 
-impl TlsWebsocketEndpointWithContext<FeedContext> for TradeEndpoint {
-    type Stream = MioStream;
+impl EndpointWithContext<FeedContext> for TradeEndpoint {
+    type Target = Websocket<TlsStream<MioStream>>;
+    type Event<'a> = Batch<'a, TlsStream<MioStream>>;
 
-    fn create_websocket(
-        &mut self,
-        addr: SocketAddr,
-        _ctx: &mut FeedContext,
-    ) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr, _ctx: &mut FeedContext) -> io::Result<Option<Self::Target>> {
         let mut ws = self
             .connection_info
             .clone()
@@ -92,6 +72,19 @@ impl TlsWebsocketEndpointWithContext<FeedContext> for TradeEndpoint {
 
         Ok(Some(ws))
     }
+
+    fn poll<'a>(
+        &'a mut self,
+        ws: &'a mut Self::Target,
+        ctx: &'a mut FeedContext,
+    ) -> io::Result<Option<Self::Event<'a>>> {
+        let now_ns = ctx.current_time_ns();
+        if now_ns > self.next_disconnect_time_ns {
+            self.next_disconnect_time_ns = now_ns + Duration::from_secs(10).as_nanos() as u64;
+            return Err(io::Error::other("disconnected due to timer"));
+        }
+        Ok(Some(ws.read_batch()?))
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -105,6 +98,12 @@ fn main() -> anyhow::Result<()> {
 
     io_service.register(endpoint_btc)?;
     loop {
-        io_service.poll(&mut ctx, |ws, ctx, endpoint| endpoint.poll(ws, ctx))?;
+        if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut ctx)? {
+            for frame in event {
+                if let WebsocketFrame::Text(fin, data) = frame? {
+                    info!("({fin}) {}", String::from_utf8_lossy(data));
+                }
+            }
+        }
     }
 }

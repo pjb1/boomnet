@@ -19,7 +19,7 @@ particularly focusing on TCP stream-oriented clients that utilise various protoc
 Simply declare dependency on `boomnet` in your `Cargo.toml` and select desired [features](#features).
 ```toml
 [dependencies]
-boomnet = { version = "0.0.89", features = ["rustls-webpki", "ws", "ext", "mio"]}
+boomnet = { version = "0.0.89", features = ["rustls-webpki", "ws", "mio"]}
 ```
 
 ## Design Principles
@@ -88,22 +88,20 @@ Provides http 1.1 client that is compatible with any non-blocking stream and doe
 The repository contains comprehensive list of [examples](https://github.com/HaveFunTrading/boomnet/tree/main/examples).
 
 The following example illustrates how to use multiple websocket connections with `IOService` in order to consume messages from the Binance cryptocurrency
-exchange. First, we need to define and implement our `Endpoint`. The framework provides `TlsWebsocketEndpoint` trait
-that we can use.
+exchange. First, we define an `Endpoint` whose target is a WebSocket over TLS.
 
 ```rust
 
 struct TradeEndpoint {
-    id: u32,
     connection_info: ConnectionInfo,
     ws_endpoint: String,
     instrument: &'static str,
 }
 
 impl TradeEndpoint {
-    pub fn new(id: u32, url: &'static str, instrument: &'static str) -> TradeEndpoint {
+    pub fn new(url: &'static str, instrument: &'static str) -> TradeEndpoint {
         let (connection_info, ws_endpoint, _) = boomnet::ws::util::parse_url(url).unwrap();
-        Self { id, connection_info, ws_endpoint, instrument, }
+        Self { connection_info, ws_endpoint, instrument, }
     }
 }
 
@@ -113,12 +111,12 @@ impl ConnectionInfoProvider for TradeEndpoint {
     }
 }
 
-impl TlsWebsocketEndpoint for TradeEndpoint {
-    
-    type Stream = MioStream;
+impl Endpoint for TradeEndpoint {
+    type Target = Websocket<TlsStream<MioStream>>;
+    type Event<'a> = boomnet::ws::Batch<'a, TlsStream<MioStream>>;
 
     // called by the IO service whenever a connection has to be established for this endpoint
-    fn create_websocket(&mut self, addr: SocketAddr) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
 
         let mut ws = TcpStream::try_from((&self.connection_info, addr))?
             .into_mio_stream()
@@ -132,18 +130,12 @@ impl TlsWebsocketEndpoint for TradeEndpoint {
 
         Ok(Some(ws))
     }
-}
 
-impl TradeEndpoint {
-    #[inline]
-    fn poll(&mut self, ws: &mut TlsWebsocket<Self::Stream>) -> io::Result<()> {
-        // iterate over available frames in the current batch
-        for frame in ws.read_batch()? {
-            if let WebsocketFrame::Text(fin, data) = frame? {
-                println!("[{}] ({fin}) {}", self.id, String::from_utf8_lossy(data));
-            }
-        }
-        Ok(())
+    fn poll<'a>(
+        &'a mut self,
+        ws: &'a mut Self::Target,
+    ) -> io::Result<Option<Self::Event<'a>>> {
+        Ok(Some(ws.read_batch()?))
     }
 }
 ```
@@ -156,18 +148,23 @@ After defining the endpoint, it is registered with the `IOService` and polled wi
 fn main() -> anyhow::Result<()> {
     let mut io_service = MioSelector::new()?.into_io_service();
 
-    let endpoint_btc = TradeEndpoint::new(0, "wss://stream1.binance.com:443/ws", "btcusdt");
-    let endpoint_eth = TradeEndpoint::new(1, "wss://stream2.binance.com:443/ws", "ethusdt");
-    let endpoint_xrp = TradeEndpoint::new(2, "wss://stream3.binance.com:443/ws", "xrpusdt");
+    let endpoint_btc = TradeEndpoint::new("wss://stream1.binance.com:443/ws", "btcusdt");
+    let endpoint_eth = TradeEndpoint::new("wss://stream2.binance.com:443/ws", "ethusdt");
+    let endpoint_xrp = TradeEndpoint::new("wss://stream3.binance.com:443/ws", "xrpusdt");
 
-    io_service.register(endpoint_btc);
-    io_service.register(endpoint_eth);
-    io_service.register(endpoint_xrp);
+    io_service.register(endpoint_btc)?;
+    io_service.register(endpoint_eth)?;
+    io_service.register(endpoint_xrp)?;
 
     loop {
         // will never block
-        io_service.poll(|ws, endpoint| endpoint.poll(ws))?;
-
+        if let IOServiceEvent::Data { handle, event } = io_service.poll()? {
+            for frame in event {
+                if let WebsocketFrame::Text(fin, data) = frame? {
+                    println!("[{handle:?}] ({fin}) {}", String::from_utf8_lossy(data));
+                }
+            }
+        }
     }
 }
 ```
@@ -181,23 +178,25 @@ struct FeedContext;
 impl Context for FeedContext {}
 ```
 
-When implementing our `TradeEndpoint` we can use `TlsWebsocketEndpointWithContext` trait instead.
+When implementing our `TradeEndpoint` we can use `EndpointWithContext` instead.
 ```rust
-impl TlsWebsocketEndpointWithContext<FeedContext> for TradeEndpoint {
-    type Stream = MioStream;
+impl EndpointWithContext<FeedContext> for TradeEndpoint {
+    type Target = Websocket<TlsStream<MioStream>>;
+    type Event<'a> = boomnet::ws::Batch<'a, TlsStream<MioStream>>;
 
-    fn create_websocket(&mut self, addr: SocketAddr, ctx: &mut FeedContext) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr, ctx: &mut FeedContext) -> io::Result<Option<Self::Target>> {
         // we now have access to context
         // ...
     }
-}
 
-impl TradeEndpoint {
-    #[inline]
-    fn poll(&mut self, ws: &mut TlsWebsocket<Self::Stream>, ctx: &mut FeedContext) -> io::Result<()> {
+    fn poll<'a>(
+        &'a mut self,
+        ws: &'a mut Self::Target,
+        ctx: &'a mut FeedContext,
+    ) -> io::Result<Option<Self::Event<'a>>> {
         // we now have access to context
         // ...
-        Ok(())
+        Ok(Some(ws.read_batch()?))
     }
 }
 ```
@@ -206,13 +205,18 @@ We will also need to create `IOService` that is `Context` aware.
 
 ```rust
 let mut context = FeedContext::new();
-let mut io_service = MioSelector::new()?.into_io_service_with_context(&mut context);
+let mut io_service = MioSelector::new()?.into_io_service_with_context();
 ```
 
 The `Context` must now be passed to the endpoint method.
 ```rust
 loop {
-    io_service.poll(&mut context, |ws, ctx, endpoint| endpoint.poll(ws, ctx))?;
+    if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut context)? {
+        for frame in event {
+            let _frame = frame?;
+            // process frame
+        }
+    }
 }
 ```
 
@@ -224,7 +228,6 @@ The framework feature set is modular, allowing for tailored functionality based 
 * [rustls-webpki](#rustls-webpki)
 * [openssl](#openssl)
 * [ktls](#ktls)
-* [ext](#ext)
 * [ws](#ws)
 * [http](#http)
 
@@ -242,9 +245,6 @@ Adds dependency on `openssl` crate and enables `TlsStream` as well as more flexi
 
 ### `ktls`
 Activates `openssl` feature and enables `KtlsStream` that offloads TLS to the kernel (KTLS).
-
-### `ext`
-Adds various extensions that provide blanket trait implementations such as `TlsWebsocketEndpoint`.
 
 ### `ws`
 Adds support for `Websocket` protocol.

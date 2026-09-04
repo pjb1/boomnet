@@ -160,6 +160,9 @@ impl<S: Read + Write + ReadHint> Websocket<S> {
     /// to receive more than one message from a single network read and when no messages are available
     /// in the current batch, the iterator will yield `None`.
     ///
+    /// Returns [`Error::Closed`] without reading from the underlying stream when the WebSocket has
+    /// already been closed.
+    ///
     /// ## Examples
     ///
     /// Process incoming frames in a batch using iterator,
@@ -196,6 +199,7 @@ impl<S: Read + Write + ReadHint> Websocket<S> {
     /// ```
     #[inline]
     pub fn read_batch(&mut self) -> Result<Batch<'_, S>, Error> {
+        self.ensure_not_closed()?;
         match self.state.read(&mut self.stream).no_block() {
             Ok(()) => Ok(Batch { websocket: self }),
             Err(err) => {
@@ -500,7 +504,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Websocket, WebsocketFrame};
+    use super::{Error, Websocket, WebsocketFrame};
     use crate::stream::ReadHint;
     use std::cell::Cell;
     use std::cmp::min;
@@ -580,5 +584,15 @@ mod tests {
         let second = websocket.read_batch().unwrap().receive_next().unwrap().unwrap();
         assert!(matches!(second, WebsocketFrame::Text(true, b"b")));
         assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn closed_websocket_rejects_batch_without_reading() {
+        let (stream, _, reads) = stream(&[], true);
+        let mut websocket = Websocket::new_with_handshake_complete(stream);
+        websocket.closed = true;
+
+        assert!(matches!(websocket.read_batch(), Err(Error::Closed)));
+        assert_eq!(reads.get(), 0);
     }
 }

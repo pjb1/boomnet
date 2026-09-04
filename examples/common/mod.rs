@@ -1,11 +1,10 @@
 use ansi_term::Color::{Green, Purple, Red, Yellow};
-use boomnet::service::endpoint::ws::{TlsWebsocket, TlsWebsocketEndpoint, TlsWebsocketEndpointWithContext};
-use boomnet::service::endpoint::{Context, DisconnectReason};
+use boomnet::service::endpoint::{Context, DisconnectReason, Endpoint, EndpointWithContext};
 use boomnet::stream::mio::{IntoMioStream, MioStream};
 use boomnet::stream::tcp::TcpStream;
-use boomnet::stream::tls::{IntoTlsStream, TlsConfigExt};
+use boomnet::stream::tls::{IntoTlsStream, TlsConfigExt, TlsStream};
 use boomnet::stream::{ConnectionInfo, ConnectionInfoProvider};
-use boomnet::ws::{IntoTlsWebsocket, IntoWebsocket, WebsocketFrame};
+use boomnet::ws::{BatchIter, IntoTlsWebsocket, IntoWebsocket, Websocket, WebsocketFrame};
 use log::{info, warn};
 use std::io;
 use std::net::SocketAddr;
@@ -26,6 +25,35 @@ pub struct TradeEndpoint {
     instrument: &'static str,
     ws_endpoint: String,
     subscribe: bool,
+}
+
+pub struct TradeBatch<'a> {
+    id: u32,
+    frames: BatchIter<'a, TlsStream<MioStream>>,
+}
+
+impl Iterator for TradeBatch<'_> {
+    type Item = Result<WebsocketFrame, boomnet::ws::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.frames.next()
+    }
+}
+
+pub fn process_batch(batch: TradeBatch<'_>) -> io::Result<()> {
+    let id = batch.id;
+    for frame in batch {
+        if let WebsocketFrame::Text(fin, data) = frame? {
+            match id % 4 {
+                0 => info!("({fin}) {}", Red.paint(String::from_utf8_lossy(data))),
+                1 => info!("({fin}) {}", Green.paint(String::from_utf8_lossy(data))),
+                2 => info!("({fin}) {}", Purple.paint(String::from_utf8_lossy(data))),
+                3 => info!("({fin}) {}", Yellow.paint(String::from_utf8_lossy(data))),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 impl TradeEndpoint {
@@ -54,49 +82,11 @@ impl TradeEndpoint {
         }
     }
 
-    pub fn subscribe(&mut self, ws: &mut TlsWebsocket<MioStream>) -> io::Result<()> {
+    pub fn subscribe(&mut self, ws: &mut Websocket<TlsStream<MioStream>>) -> io::Result<()> {
         ws.send_text(
             true,
             Some(format!(r#"{{"method":"SUBSCRIBE","params":["{}@trade"],"id":1}}"#, self.instrument).as_bytes()),
         )?;
-        Ok(())
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn poll(&mut self, ws: &mut TlsWebsocket<<Self as TlsWebsocketEndpoint>::Stream>) -> io::Result<()> {
-        for frame in ws.read_batch()? {
-            if let WebsocketFrame::Text(fin, data) = frame? {
-                match self.id % 4 {
-                    0 => info!("({fin}) {}", Red.paint(String::from_utf8_lossy(data))),
-                    1 => info!("({fin}) {}", Green.paint(String::from_utf8_lossy(data))),
-                    2 => info!("({fin}) {}", Purple.paint(String::from_utf8_lossy(data))),
-                    3 => info!("({fin}) {}", Yellow.paint(String::from_utf8_lossy(data))),
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn poll_ctx(
-        &mut self,
-        ws: &mut TlsWebsocket<<Self as TlsWebsocketEndpoint>::Stream>,
-        _ctx: &mut FeedContext,
-    ) -> io::Result<()> {
-        for frame in ws.read_batch()? {
-            if let WebsocketFrame::Text(fin, data) = frame? {
-                match self.id % 4 {
-                    0 => info!("({fin}) {}", Red.paint(String::from_utf8_lossy(data))),
-                    1 => info!("({fin}) {}", Green.paint(String::from_utf8_lossy(data))),
-                    2 => info!("({fin}) {}", Purple.paint(String::from_utf8_lossy(data))),
-                    3 => info!("({fin}) {}", Yellow.paint(String::from_utf8_lossy(data))),
-                    _ => {}
-                }
-            }
-        }
         Ok(())
     }
 }
@@ -107,10 +97,11 @@ impl ConnectionInfoProvider for TradeEndpoint {
     }
 }
 
-impl TlsWebsocketEndpoint for TradeEndpoint {
-    type Stream = MioStream;
+impl Endpoint for TradeEndpoint {
+    type Target = Websocket<TlsStream<MioStream>>;
+    type Event<'a> = TradeBatch<'a>;
 
-    fn create_websocket(&mut self, addr: SocketAddr) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = TcpStream::try_from((&self.connection_info, addr))?
             .into_mio_stream()
             .into_tls_stream_with_config(|cfg| cfg.with_no_cert_verification())?
@@ -123,20 +114,24 @@ impl TlsWebsocketEndpoint for TradeEndpoint {
         Ok(Some(ws))
     }
 
-    fn can_recreate(&mut self, reason: DisconnectReason) -> bool {
+    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
+        Ok(Some(TradeBatch {
+            id: self.id,
+            frames: ws.read_batch()?.into_iter(),
+        }))
+    }
+
+    fn can_recreate(&mut self, reason: &DisconnectReason) -> bool {
         warn!("connection disconnected: {reason}");
         true
     }
 }
 
-impl TlsWebsocketEndpointWithContext<FeedContext> for TradeEndpoint {
-    type Stream = MioStream;
+impl EndpointWithContext<FeedContext> for TradeEndpoint {
+    type Target = Websocket<TlsStream<MioStream>>;
+    type Event<'a> = TradeBatch<'a>;
 
-    fn create_websocket(
-        &mut self,
-        addr: SocketAddr,
-        _ctx: &mut FeedContext,
-    ) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr, _ctx: &mut FeedContext) -> io::Result<Option<Self::Target>> {
         let mut ws = TcpStream::try_from((&self.connection_info, addr))?
             .into_mio_stream()
             .into_tls_websocket(&self.ws_endpoint)?;
@@ -146,5 +141,16 @@ impl TlsWebsocketEndpointWithContext<FeedContext> for TradeEndpoint {
         }
 
         Ok(Some(ws))
+    }
+
+    fn poll<'a>(
+        &'a mut self,
+        ws: &'a mut Self::Target,
+        _ctx: &'a mut FeedContext,
+    ) -> io::Result<Option<Self::Event<'a>>> {
+        Ok(Some(TradeBatch {
+            id: self.id,
+            frames: ws.read_batch()?.into_iter(),
+        }))
     }
 }

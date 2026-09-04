@@ -5,6 +5,7 @@ use tungstenite::Utf8Bytes;
 use crate::endpoint::{TestContext, TestEndpoint};
 use ::boomnet::stream::buffer::IntoBufferedStream;
 use ::boomnet::ws::IntoWebsocket;
+use boomnet::service::IOServiceEvent;
 use boomnet::service::IntoIOServiceWithContext;
 use boomnet::service::select::direct::DirectSelector;
 use boomnet::stream::ConnectionInfo;
@@ -68,9 +69,11 @@ fn boomnet_rtt_benchmark_io_service(c: &mut Criterion) {
     group.bench_function("boomnet_rtt_io_service", |b| {
         b.iter(|| {
             loop {
-                io_service
-                    .poll(&mut ctx, |ws, ctx, endpoint| endpoint.poll(ws, ctx))
-                    .unwrap();
+                if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut ctx).unwrap() {
+                    for frame in event {
+                        black_box(frame.unwrap());
+                    }
+                }
                 if ctx.processed == 100 {
                     ctx.wants_write = true;
                     ctx.processed = 0;

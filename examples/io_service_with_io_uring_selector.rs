@@ -1,9 +1,10 @@
-use boomnet::service::IntoIOService;
-use boomnet::service::endpoint::ws::{TlsWebsocket, TlsWebsocketEndpoint};
+use boomnet::service::endpoint::Endpoint;
 use boomnet::service::select::io_uring::{IoUringConfig, IoUringSelector};
+use boomnet::service::{IOServiceEvent, IntoIOService};
 use boomnet::stream::io_uring::{IntoIoUringStream, IoUringStream};
+use boomnet::stream::tls::TlsStream;
 use boomnet::stream::{ConnectionInfo, ConnectionInfoProvider};
-use boomnet::ws::{IntoTlsWebsocket, WebsocketFrame};
+use boomnet::ws::{Batch, IntoTlsWebsocket, Websocket, WebsocketFrame};
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -24,16 +25,6 @@ impl TradeEndpoint {
             ws_endpoint: url.path().to_owned(),
         }
     }
-
-    #[inline]
-    fn poll(&mut self, ws: &mut TlsWebsocket<IoUringStream>) -> io::Result<()> {
-        for frame in ws.read_batch()? {
-            if let WebsocketFrame::Text(fin, data) = frame? {
-                println!("({fin}) {}", String::from_utf8_lossy(data));
-            }
-        }
-        Ok(())
-    }
 }
 
 impl ConnectionInfoProvider for TradeEndpoint {
@@ -42,10 +33,11 @@ impl ConnectionInfoProvider for TradeEndpoint {
     }
 }
 
-impl TlsWebsocketEndpoint for TradeEndpoint {
-    type Stream = IoUringStream;
+impl Endpoint for TradeEndpoint {
+    type Target = Websocket<TlsStream<IoUringStream>>;
+    type Event<'a> = Batch<'a, TlsStream<IoUringStream>>;
 
-    fn create_websocket(&mut self, addr: SocketAddr) -> io::Result<Option<TlsWebsocket<Self::Stream>>> {
+    fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = self
             .connection_info
             .clone()
@@ -57,6 +49,10 @@ impl TlsWebsocketEndpoint for TradeEndpoint {
             Some(format!(r#"{{"method":"SUBSCRIBE","params":["{}@trade"],"id":1}}"#, self.instrument).as_bytes()),
         )?;
         Ok(Some(ws))
+    }
+
+    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
+        Ok(Some(ws.read_batch()?))
     }
 }
 
@@ -77,6 +73,12 @@ fn main() -> anyhow::Result<()> {
     io_service.register(TradeEndpoint::new("wss://stream.binance.com:443/ws", "ethusdt"))?;
 
     loop {
-        io_service.poll(|ws, endpoint| endpoint.poll(ws))?;
+        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
+            for frame in event {
+                if let WebsocketFrame::Text(fin, data) = frame? {
+                    println!("({fin}) {}", String::from_utf8_lossy(data));
+                }
+            }
+        }
     }
 }

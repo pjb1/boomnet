@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
 use std::time::Duration;
@@ -8,7 +7,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::service::dns::BlockingDnsResolver;
 use crate::service::endpoint::{Context, Endpoint, EndpointWithContext};
-use crate::service::node::IONode;
+use crate::service::node::{IONode, IONodes};
 use crate::service::select::{Selectable, Selector, SelectorToken};
 use crate::service::time::SystemTimeClockSource;
 use crate::service::{IOService, IntoIOService, IntoIOServiceWithContext};
@@ -48,12 +47,12 @@ impl<S: Source + Selectable> Selector for MioSelector<S> {
         self.poll.registry().deregister(io_node.as_stream_mut())
     }
 
-    fn poll<E>(&mut self, io_nodes: &mut HashMap<SelectorToken, IONode<Self::Target, E>>) -> io::Result<()> {
+    fn poll<E>(&mut self, io_nodes: &mut IONodes<Self::Target, E>) -> io::Result<()> {
         self.poll.poll(&mut self.events, NO_WAIT)?;
         for ev in self.events.iter() {
             let token = ev.token();
             let stream = io_nodes
-                .get_mut(&(token.0 as SelectorToken))
+                .get_mut(token.0 as SelectorToken)
                 .ok_or_else(|| io::Error::other("io node not found"))?
                 .as_stream_mut();
             if ev.is_writable() && stream.connected()? {

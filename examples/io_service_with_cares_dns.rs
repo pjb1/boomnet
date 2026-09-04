@@ -3,10 +3,10 @@ mod common;
 
 #[cfg(all(feature = "c-ares", feature = "mio"))]
 mod deps {
-    pub use crate::common::{FeedContext, TradeEndpoint};
-    pub use boomnet::service::IntoIOServiceWithContext;
+    pub use crate::common::{FeedContext, TradeEndpoint, process_batch};
     pub use boomnet::service::dns::CaresDnsResolver;
     pub use boomnet::service::select::mio::MioSelector;
+    pub use boomnet::service::{IOServiceEvent, IntoIOServiceWithContext};
     pub use std::time::Duration;
 }
 
@@ -33,7 +33,9 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_xrp)?;
 
     loop {
-        io_service.poll(&mut ctx, |ws, ctx, endpoint| endpoint.poll_ctx(ws, ctx))?;
+        if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut ctx)? {
+            process_batch(event)?;
+        }
     }
 }
 

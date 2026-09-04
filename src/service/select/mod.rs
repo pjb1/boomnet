@@ -1,7 +1,6 @@
 //! OS specific socket event notification mechanisms like `epoll`.
 
-use crate::service::node::IONode;
-use std::collections::HashMap;
+use crate::service::node::{IONode, IONodes};
 use std::io;
 
 pub mod direct;
@@ -28,7 +27,7 @@ pub trait Selector {
 
     fn unregister<E>(&mut self, io_node: &mut IONode<Self::Target, E>) -> io::Result<()>;
 
-    fn poll<E>(&mut self, io_nodes: &mut HashMap<SelectorToken, IONode<Self::Target, E>>) -> io::Result<()>;
+    fn poll<E>(&mut self, io_nodes: &mut IONodes<Self::Target, E>) -> io::Result<()>;
 
     fn next_token(&mut self) -> SelectorToken;
 }
