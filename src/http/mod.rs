@@ -345,10 +345,10 @@ impl ConnectionPool for SingleTlsConnectionPool {
 
     fn release(&mut self, conn: Option<Connection<Self::Stream>>) {
         self.has_active_connection = false;
-        if let Some(conn) = conn {
-            if !conn.disconnected {
-                let _ = self.conn.insert(conn);
-            }
+        if let Some(conn) = conn
+            && !conn.disconnected
+        {
+            let _ = self.conn.insert(conn);
         }
     }
 }
@@ -471,39 +471,39 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpRequest<C, CHUN
             }
             match self.state {
                 State::ReadingHeaders => {
-                    if conn.buffer.len() >= 4 {
-                        if let Some(headers_end) = conn.header_finder.find(&conn.buffer, b"\r\n\r\n") {
-                            let header_len = headers_end + 4;
-                            let header_slice = &conn.buffer[..header_len];
-                            // now parse headers
-                            let mut headers = [EMPTY_HEADER; 32];
-                            let mut resp = Response::new(&mut headers);
-                            match resp.parse(header_slice) {
-                                Ok(httparse::Status::Complete(_)) => {
-                                    let status_code = resp
-                                        .code
-                                        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing status code"))?;
-                                    let mut content_len = 0;
-                                    for header in resp.headers {
-                                        if header.name.eq_ignore_ascii_case("Content-Length") {
-                                            content_len = std::str::from_utf8(header.value)
-                                                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-                                                .parse()
-                                                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-                                            break;
-                                        }
+                    if conn.buffer.len() >= 4
+                        && let Some(headers_end) = conn.header_finder.find(&conn.buffer, b"\r\n\r\n")
+                    {
+                        let header_len = headers_end + 4;
+                        let header_slice = &conn.buffer[..header_len];
+                        // now parse headers
+                        let mut headers = [EMPTY_HEADER; 32];
+                        let mut resp = Response::new(&mut headers);
+                        match resp.parse(header_slice) {
+                            Ok(httparse::Status::Complete(_)) => {
+                                let status_code = resp
+                                    .code
+                                    .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing status code"))?;
+                                let mut content_len = 0;
+                                for header in resp.headers {
+                                    if header.name.eq_ignore_ascii_case("Content-Length") {
+                                        content_len = std::str::from_utf8(header.value)
+                                            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
+                                            .parse()
+                                            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+                                        break;
                                     }
-                                    self.state = State::ReadingBody {
-                                        header_len,
-                                        content_len,
-                                        status_code,
-                                    };
                                 }
-                                Ok(httparse::Status::Partial) => {
-                                    return Err(io::Error::new(ErrorKind::InvalidData, "unable to parse headers"));
-                                }
-                                Err(err) => return Err(io::Error::new(ErrorKind::InvalidData, err)),
+                                self.state = State::ReadingBody {
+                                    header_len,
+                                    content_len,
+                                    status_code,
+                                };
                             }
+                            Ok(httparse::Status::Partial) => {
+                                return Err(io::Error::new(ErrorKind::InvalidData, "unable to parse headers"));
+                            }
+                            Err(err) => return Err(io::Error::new(ErrorKind::InvalidData, err)),
                         }
                     }
                 }

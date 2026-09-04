@@ -10,11 +10,11 @@ fn main() -> anyhow::Result<()> {
     ws.send_ping(Some("test".as_bytes()))?;
 
     loop {
-        if let Some(frame) = ws.receive_next() {
-            if let WebsocketFrame::Pong(payload) = frame? {
-                println!("Received pong: {}", String::from_utf8_lossy(payload));
-                break;
-            }
+        if let Some(frame) = ws.receive_next()
+            && let WebsocketFrame::Pong(payload) = frame?
+        {
+            println!("Received pong: {}", String::from_utf8_lossy(payload));
+            break;
         }
     }
 
