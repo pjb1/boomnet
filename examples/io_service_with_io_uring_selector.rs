@@ -4,7 +4,7 @@ use boomnet::service::{IOServiceEvent, IntoIOService};
 use boomnet::stream::io_uring::{IntoIoUringStream, IoUringStream};
 use boomnet::stream::tls::TlsStream;
 use boomnet::stream::{ConnectionInfo, ConnectionInfoProvider};
-use boomnet::ws::{Batch, IntoTlsWebsocket, Websocket, WebsocketFrame};
+use boomnet::ws::{IntoTlsWebsocket, Websocket, WebsocketFrame};
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -35,7 +35,6 @@ impl ConnectionInfoProvider for TradeEndpoint {
 
 impl Endpoint for TradeEndpoint {
     type Target = Websocket<TlsStream<IoUringStream>>;
-    type Event<'a> = Batch<'a, TlsStream<IoUringStream>>;
 
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = self
@@ -49,10 +48,6 @@ impl Endpoint for TradeEndpoint {
             Some(format!(r#"{{"method":"SUBSCRIBE","params":["{}@trade"],"id":1}}"#, self.instrument).as_bytes()),
         )?;
         Ok(Some(ws))
-    }
-
-    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
-        Ok(Some(ws.read_batch()?))
     }
 }
 
@@ -73,10 +68,17 @@ fn main() -> anyhow::Result<()> {
     io_service.register(TradeEndpoint::new("wss://stream.binance.com:443/ws", "ethusdt"))?;
 
     loop {
-        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
-            for frame in event {
-                if let WebsocketFrame::Text(fin, data) = frame? {
-                    println!("({fin}) {}", String::from_utf8_lossy(data));
+        for event in io_service.poll()? {
+            if let IOServiceEvent::Active(active) = event {
+                let batch = active.try_with(|ws| {
+                    ws.read_batch()
+                        .map(|batch| batch.into_iter().map(|frame| frame.map_err(io::Error::from)))
+                        .map_err(io::Error::from)
+                })?;
+                for frame in batch {
+                    if let WebsocketFrame::Text(fin, data) = frame? {
+                        println!("({fin}) {}", String::from_utf8_lossy(data));
+                    }
                 }
             }
         }

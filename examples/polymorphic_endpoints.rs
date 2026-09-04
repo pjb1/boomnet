@@ -16,11 +16,6 @@ use idle::IdleStrategy;
 use log::info;
 use url::Url;
 
-enum MarketDataEvent<'a> {
-    Trade(boomnet::ws::Batch<'a, TlsStream<MioStream>>),
-    Ticker(boomnet::ws::Batch<'a, TlsStream<MioStream>>),
-}
-
 enum MarketDataEndpoint {
     Trade(TradeEndpoint),
     Ticker(TickerEndpoint),
@@ -37,19 +32,11 @@ impl ConnectionInfoProvider for MarketDataEndpoint {
 
 impl Endpoint for MarketDataEndpoint {
     type Target = Websocket<TlsStream<MioStream>>;
-    type Event<'a> = MarketDataEvent<'a>;
 
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         match self {
             MarketDataEndpoint::Ticker(ticker) => ticker.create_target(addr),
             MarketDataEndpoint::Trade(trade) => trade.create_target(addr),
-        }
-    }
-
-    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
-        match self {
-            MarketDataEndpoint::Trade(_) => Ok(Some(MarketDataEvent::Trade(ws.read_batch()?))),
-            MarketDataEndpoint::Ticker(_) => Ok(Some(MarketDataEvent::Ticker(ws.read_batch()?))),
         }
     }
 }
@@ -79,7 +66,6 @@ impl ConnectionInfoProvider for TradeEndpoint {
 
 impl Endpoint for TradeEndpoint {
     type Target = Websocket<TlsStream<MioStream>>;
-    type Event<'a> = boomnet::ws::Batch<'a, TlsStream<MioStream>>;
 
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = self
@@ -95,10 +81,6 @@ impl Endpoint for TradeEndpoint {
         )?;
 
         Ok(Some(ws))
-    }
-
-    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
-        Ok(Some(ws.read_batch()?))
     }
 }
 
@@ -127,7 +109,6 @@ impl ConnectionInfoProvider for TickerEndpoint {
 
 impl Endpoint for TickerEndpoint {
     type Target = Websocket<TlsStream<MioStream>>;
-    type Event<'a> = boomnet::ws::Batch<'a, TlsStream<MioStream>>;
 
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = self
@@ -144,10 +125,6 @@ impl Endpoint for TickerEndpoint {
 
         Ok(Some(ws))
     }
-
-    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
-        Ok(Some(ws.read_batch()?))
-    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -158,24 +135,25 @@ fn main() -> anyhow::Result<()> {
     let ticker = MarketDataEndpoint::Ticker(TickerEndpoint::new(0, "wss://stream.binance.com:443/ws", "btcusdt"));
     let trade = MarketDataEndpoint::Trade(TradeEndpoint::new(1, "wss://stream.binance.com:443/ws", "ethusdt"));
 
-    io_service.register(ticker)?;
-    io_service.register(trade)?;
+    let ticker_handle = io_service.register(ticker)?;
+    let trade_handle = io_service.register(trade)?;
 
     loop {
-        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
-            match event {
-                MarketDataEvent::Trade(batch) => {
-                    for frame in batch {
-                        if let WebsocketFrame::Text(fin, data) = frame? {
-                            info!("[TRADE] ({fin}) {}", String::from_utf8_lossy(data));
-                        }
-                    }
-                }
-                MarketDataEvent::Ticker(batch) => {
-                    for frame in batch {
-                        if let WebsocketFrame::Text(fin, data) = frame? {
-                            info!("[TICKER] ({fin}) {}", String::from_utf8_lossy(data));
-                        }
+        for event in io_service.poll()? {
+            if let IOServiceEvent::Active(active) = event {
+                let label = match active.handle() {
+                    handle if handle == trade_handle => "TRADE",
+                    handle if handle == ticker_handle => "TICKER",
+                    _ => unreachable!("unknown endpoint handle"),
+                };
+                let batch = active.try_with(|ws| {
+                    ws.read_batch()
+                        .map(|batch| batch.into_iter().map(|frame| frame.map_err(io::Error::from)))
+                        .map_err(io::Error::from)
+                })?;
+                for frame in batch {
+                    if let WebsocketFrame::Text(fin, data) = frame? {
+                        info!("[{label}] ({fin}) {}", String::from_utf8_lossy(data));
                     }
                 }
             }

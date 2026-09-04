@@ -1,4 +1,4 @@
-use crate::common::{FeedContext, TradeEndpoint, process_batch};
+use crate::common::{FeedContext, TradeEndpoint, process_active};
 use boomnet::service::dns::AsyncDnsResolver;
 use boomnet::service::select::mio::MioSelector;
 use boomnet::service::{IOServiceEvent, IntoIOServiceWithContext};
@@ -24,8 +24,10 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_xrp)?;
 
     loop {
-        if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut ctx)? {
-            process_batch(event)?;
+        for event in io_service.poll(&mut ctx)? {
+            if let IOServiceEvent::Active(active) = event {
+                process_active(active)?;
+            }
         }
     }
 }

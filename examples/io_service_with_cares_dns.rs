@@ -3,7 +3,7 @@ mod common;
 
 #[cfg(all(feature = "c-ares", feature = "mio"))]
 mod deps {
-    pub use crate::common::{FeedContext, TradeEndpoint, process_batch};
+    pub use crate::common::{FeedContext, TradeEndpoint, process_active};
     pub use boomnet::service::dns::CaresDnsResolver;
     pub use boomnet::service::select::mio::MioSelector;
     pub use boomnet::service::{IOServiceEvent, IntoIOServiceWithContext};
@@ -33,8 +33,10 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_xrp)?;
 
     loop {
-        if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut ctx)? {
-            process_batch(event)?;
+        for event in io_service.poll(&mut ctx)? {
+            if let IOServiceEvent::Active(active) = event {
+                process_active(active)?;
+            }
         }
     }
 }

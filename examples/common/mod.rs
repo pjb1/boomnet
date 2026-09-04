@@ -1,10 +1,10 @@
-use ansi_term::Color::{Green, Purple, Red, Yellow};
+use boomnet::service::ActiveEndpoint;
 use boomnet::service::endpoint::{Context, DisconnectReason, Endpoint, EndpointWithContext};
 use boomnet::stream::mio::{IntoMioStream, MioStream};
 use boomnet::stream::tcp::TcpStream;
 use boomnet::stream::tls::{IntoTlsStream, TlsConfigExt, TlsStream};
 use boomnet::stream::{ConnectionInfo, ConnectionInfoProvider};
-use boomnet::ws::{BatchIter, IntoTlsWebsocket, IntoWebsocket, Websocket, WebsocketFrame};
+use boomnet::ws::{IntoTlsWebsocket, IntoWebsocket, Websocket, WebsocketFrame};
 use log::{info, warn};
 use std::io;
 use std::net::SocketAddr;
@@ -20,39 +20,23 @@ impl FeedContext {
 }
 
 pub struct TradeEndpoint {
-    id: u32,
     connection_info: ConnectionInfo,
     instrument: &'static str,
     ws_endpoint: String,
     subscribe: bool,
 }
 
-pub struct TradeBatch<'a> {
-    #[allow(dead_code)]
-    id: u32,
-    frames: BatchIter<'a, TlsStream<MioStream>>,
-}
-
-impl Iterator for TradeBatch<'_> {
-    type Item = Result<WebsocketFrame, boomnet::ws::Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.frames.next()
-    }
-}
-
 #[allow(dead_code)]
-pub fn process_batch(batch: TradeBatch<'_>) -> io::Result<()> {
-    let id = batch.id;
+pub fn process_active(active: ActiveEndpoint<'_, Websocket<TlsStream<MioStream>>>) -> io::Result<()> {
+    let handle = active.handle();
+    let batch = active.try_with(|ws| {
+        ws.read_batch()
+            .map(|batch| batch.into_iter().map(|frame| frame.map_err(io::Error::from)))
+            .map_err(io::Error::from)
+    })?;
     for frame in batch {
         if let WebsocketFrame::Text(fin, data) = frame? {
-            match id % 4 {
-                0 => info!("({fin}) {}", Red.paint(String::from_utf8_lossy(data))),
-                1 => info!("({fin}) {}", Green.paint(String::from_utf8_lossy(data))),
-                2 => info!("({fin}) {}", Purple.paint(String::from_utf8_lossy(data))),
-                3 => info!("({fin}) {}", Yellow.paint(String::from_utf8_lossy(data))),
-                _ => {}
-            }
+            info!("[{handle:?}] ({fin}) {}", String::from_utf8_lossy(data));
         }
     }
     Ok(())
@@ -65,7 +49,7 @@ impl TradeEndpoint {
     }
 
     pub fn new_with_subscribe(
-        id: u32,
+        _id: u32,
         url: &'static str,
         net_iface: Option<&'static str>,
         instrument: &'static str,
@@ -76,7 +60,6 @@ impl TradeEndpoint {
             connection_info = connection_info.with_net_iface_from_name(net_iface);
         }
         Self {
-            id,
             connection_info,
             instrument,
             ws_endpoint,
@@ -101,7 +84,6 @@ impl ConnectionInfoProvider for TradeEndpoint {
 
 impl Endpoint for TradeEndpoint {
     type Target = Websocket<TlsStream<MioStream>>;
-    type Event<'a> = TradeBatch<'a>;
 
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = TcpStream::try_from((&self.connection_info, addr))?
@@ -115,14 +97,6 @@ impl Endpoint for TradeEndpoint {
 
         Ok(Some(ws))
     }
-
-    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
-        Ok(Some(TradeBatch {
-            id: self.id,
-            frames: ws.read_batch()?.into_iter(),
-        }))
-    }
-
     fn can_recreate(&mut self, reason: &DisconnectReason) -> bool {
         warn!("connection disconnected: {reason}");
         true
@@ -131,7 +105,6 @@ impl Endpoint for TradeEndpoint {
 
 impl EndpointWithContext<FeedContext> for TradeEndpoint {
     type Target = Websocket<TlsStream<MioStream>>;
-    type Event<'a> = TradeBatch<'a>;
 
     fn create_target(&mut self, addr: SocketAddr, _ctx: &mut FeedContext) -> io::Result<Option<Self::Target>> {
         let mut ws = TcpStream::try_from((&self.connection_info, addr))?
@@ -143,16 +116,5 @@ impl EndpointWithContext<FeedContext> for TradeEndpoint {
         }
 
         Ok(Some(ws))
-    }
-
-    fn poll<'a>(
-        &'a mut self,
-        ws: &'a mut Self::Target,
-        _ctx: &'a mut FeedContext,
-    ) -> io::Result<Option<Self::Event<'a>>> {
-        Ok(Some(TradeBatch {
-            id: self.id,
-            frames: ws.read_batch()?.into_iter(),
-        }))
     }
 }

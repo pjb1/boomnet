@@ -113,7 +113,6 @@ impl ConnectionInfoProvider for TradeEndpoint {
 
 impl Endpoint for TradeEndpoint {
     type Target = Websocket<TlsStream<MioStream>>;
-    type Event<'a> = boomnet::ws::Batch<'a, TlsStream<MioStream>>;
 
     // called by the IO service whenever a connection has to be established for this endpoint
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
@@ -130,18 +129,12 @@ impl Endpoint for TradeEndpoint {
 
         Ok(Some(ws))
     }
-
-    fn poll<'a>(
-        &'a mut self,
-        ws: &'a mut Self::Target,
-    ) -> io::Result<Option<Self::Event<'a>>> {
-        Ok(Some(ws.read_batch()?))
-    }
 }
 ```
 
 After defining the endpoint, it is registered with the `IOService` and polled within an event loop. The service handles
-`Endpoint` connection management and reconnection in case of disconnection.
+connection lifecycle and exposes every active target through an `ActiveEndpoint` guard. I/O performed with `try_with`
+automatically starts the endpoint's reconnection lifecycle if it fails.
 
 ```rust
 
@@ -158,11 +151,17 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         // will never block
-        if let IOServiceEvent::Data { handle, event } = io_service.poll()? {
-            for frame in event {
-                if let WebsocketFrame::Text(fin, data) = frame? {
-                    println!("[{handle:?}] ({fin}) {}", String::from_utf8_lossy(data));
-                }
+        for event in io_service.poll()? {
+            if let IOServiceEvent::Active(active) = event {
+                let handle = active.handle();
+                active.try_with(|ws| {
+                    for frame in ws.read_batch()? {
+                        if let WebsocketFrame::Text(fin, data) = frame? {
+                            println!("[{handle:?}] ({fin}) {}", String::from_utf8_lossy(data));
+                        }
+                    }
+                    Ok(())
+                })?;
             }
         }
     }
@@ -182,21 +181,10 @@ When implementing our `TradeEndpoint` we can use `EndpointWithContext` instead.
 ```rust
 impl EndpointWithContext<FeedContext> for TradeEndpoint {
     type Target = Websocket<TlsStream<MioStream>>;
-    type Event<'a> = boomnet::ws::Batch<'a, TlsStream<MioStream>>;
 
     fn create_target(&mut self, addr: SocketAddr, ctx: &mut FeedContext) -> io::Result<Option<Self::Target>> {
         // we now have access to context
         // ...
-    }
-
-    fn poll<'a>(
-        &'a mut self,
-        ws: &'a mut Self::Target,
-        ctx: &'a mut FeedContext,
-    ) -> io::Result<Option<Self::Event<'a>>> {
-        // we now have access to context
-        // ...
-        Ok(Some(ws.read_batch()?))
     }
 }
 ```
@@ -208,13 +196,19 @@ let mut context = FeedContext::new();
 let mut io_service = MioSelector::new()?.into_io_service_with_context();
 ```
 
-The `Context` must now be passed to the endpoint method.
+The `Context` is passed to the service for lifecycle callbacks. The returned iterator does not
+borrow it, so application processing can use it too.
 ```rust
 loop {
-    if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut context)? {
-        for frame in event {
-            let _frame = frame?;
-            // process frame
+    for event in io_service.poll(&mut context)? {
+        if let IOServiceEvent::Active(active) = event {
+            active.try_with(|ws| {
+                for frame in ws.read_batch()? {
+                    let frame = frame?;
+                    context.process(frame);
+                }
+                Ok(())
+            })?;
         }
     }
 }

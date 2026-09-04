@@ -1,4 +1,4 @@
-use crate::common::{TradeEndpoint, process_batch};
+use crate::common::{TradeEndpoint, process_active};
 use boomnet::service::select::mio::MioSelector;
 use boomnet::service::{IOServiceEvent, IntoIOService};
 
@@ -19,8 +19,10 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_xrp)?;
 
     loop {
-        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
-            process_batch(event)?;
+        for event in io_service.poll()? {
+            if let IOServiceEvent::Active(active) = event {
+                process_active(active)?;
+            }
         }
     }
 }

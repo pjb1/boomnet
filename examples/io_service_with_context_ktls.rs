@@ -78,7 +78,6 @@ impl ConnectionInfoProvider for TradeConnectionFactory {
 #[cfg(feature = "ktls")]
 impl Endpoint for TradeConnectionFactory {
     type Target = TradeConnection;
-    type Event<'a> = boomnet::ws::Batch<'a, KtlsStream<MioStream>>;
 
     fn create_target(&mut self, addr: SocketAddr) -> std::io::Result<Option<Self::Target>> {
         let mut ws = TcpStream::try_from((&self.connection_info, addr))?
@@ -90,11 +89,6 @@ impl Endpoint for TradeConnectionFactory {
 
         Ok(Some(TradeConnection { ws }))
     }
-
-    fn poll<'a>(&'a mut self, target: &'a mut Self::Target) -> std::io::Result<Option<Self::Event<'a>>> {
-        Ok(Some(target.ws.read_batch()?))
-    }
-
     fn can_recreate(&mut self, reason: &DisconnectReason) -> bool {
         println!("on disconnect: reason={}", reason);
         true
@@ -110,10 +104,19 @@ fn main() -> anyhow::Result<()> {
     io_service.register(TradeConnectionFactory::new())?;
 
     loop {
-        if let IOServiceEvent::Data { event, .. } = io_service.poll()? {
-            for frame in event {
-                if let WebsocketFrame::Text(fin, body) = frame? {
-                    println!("({fin}) {}", String::from_utf8_lossy(body));
+        for event in io_service.poll()? {
+            if let IOServiceEvent::Active(active) = event {
+                let batch = active.try_with(|target| {
+                    target
+                        .ws
+                        .read_batch()
+                        .map(|batch| batch.into_iter().map(|frame| frame.map_err(std::io::Error::from)))
+                        .map_err(std::io::Error::from)
+                })?;
+                for frame in batch {
+                    if let WebsocketFrame::Text(fin, body) = frame? {
+                        println!("({fin}) {}", String::from_utf8_lossy(body));
+                    }
                 }
             }
         }

@@ -6,27 +6,15 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// Entry point for the application logic. Endpoints are registered and Managed by 'IOService'.
+/// Describes how an I/O target is created and recreated by [`crate::service::IOService`].
 pub trait Endpoint: ConnectionInfoProvider {
     /// Defines protocol and stream this endpoint operates on.
     type Target;
-
-    /// Event produced while polling the endpoint.
-    type Event<'a>
-    where
-        Self: 'a,
-        Self::Target: 'a;
 
     /// Used by the `IOService` to create connection upon disconnect by passing resolved `addr`.
     /// If the endpoint does not want to connect at this stage it should return `Ok(None)` and
     /// await the next connection attempt with (possibly) different `addr`.
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>>;
-
-    /// Poll the active target for the next available event.
-    ///
-    /// `Ok(None)` means the selected endpoint currently has no event. An error begins the
-    /// disconnect/recreation lifecycle and is passed to [`Endpoint::can_recreate`].
-    fn poll<'a>(&'a mut self, target: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>>;
 
     /// Upon disconnection `IOService` will query the endpoint if the connection should be
     /// recreated, passing the disconnect `reason`. Returning `false` makes the service return
@@ -47,29 +35,15 @@ pub trait Endpoint: ConnectionInfoProvider {
 /// as context.
 pub trait Context {}
 
-/// Entry point for the application logic that exposes user provided [Context].
-/// Endpoints are registered and Managed by `IOService`.
+/// Describes how an I/O target is created and recreated with access to user-provided [Context].
 pub trait EndpointWithContext<C>: ConnectionInfoProvider {
     /// Defines protocol and stream this endpoint operates on.
     type Target;
-
-    /// Event produced while polling the endpoint.
-    type Event<'a>
-    where
-        Self: 'a,
-        Self::Target: 'a,
-        C: 'a;
 
     /// Used by the `IOService` to create connection upon disconnect passing resolved `addr` and
     /// user provided `Context`. If the endpoint does not want to connect at this stage it should
     /// return `Ok(None)` and await the next connection attempt with (possibly) different `addr`.
     fn create_target(&mut self, addr: SocketAddr, context: &mut C) -> io::Result<Option<Self::Target>>;
-
-    /// Poll the active target for the next available event.
-    ///
-    /// `Ok(None)` means the selected endpoint currently has no event. An error begins the
-    /// disconnect/recreation lifecycle and is passed to [`EndpointWithContext::can_recreate`].
-    fn poll<'a>(&'a mut self, target: &'a mut Self::Target, context: &'a mut C) -> io::Result<Option<Self::Event<'a>>>;
 
     /// Upon disconnection `IOService` will query the endpoint if the connection should be
     /// recreated, passing the disconnect `reason`. Returning `false` makes the service return

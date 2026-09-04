@@ -69,9 +69,26 @@ fn boomnet_rtt_benchmark_io_service(c: &mut Criterion) {
     group.bench_function("boomnet_rtt_io_service", |b| {
         b.iter(|| {
             loop {
-                if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut ctx).unwrap() {
-                    for frame in event {
-                        black_box(frame.unwrap());
+                for event in io_service.poll(&mut ctx).unwrap() {
+                    if let IOServiceEvent::Active(active) = event {
+                        if ctx.wants_write {
+                            active
+                                .try_with(|ws| ws.send_text(true, Some(MSG.as_bytes())).map_err(std::io::Error::from))
+                                .unwrap();
+                            ctx.wants_write = false;
+                        } else {
+                            let batch = active
+                                .try_with(|ws| {
+                                    ws.read_batch()
+                                        .map(|batch| batch.into_iter().map(|frame| frame.map_err(std::io::Error::from)))
+                                        .map_err(std::io::Error::from)
+                                })
+                                .unwrap();
+                            for frame in batch {
+                                black_box(frame.unwrap());
+                                ctx.processed += 1;
+                            }
+                        }
                     }
                 }
                 if ctx.processed == 100 {

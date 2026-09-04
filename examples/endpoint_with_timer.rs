@@ -8,42 +8,54 @@ use boomnet::service::{IOServiceEvent, IntoIOServiceWithContext};
 use boomnet::stream::mio::{IntoMioStream, MioStream};
 use boomnet::stream::tls::TlsStream;
 use boomnet::stream::{ConnectionInfo, ConnectionInfoProvider};
-use boomnet::ws::{Batch, IntoTlsWebsocket, Websocket, WebsocketFrame};
+use boomnet::ws::{IntoTlsWebsocket, Websocket, WebsocketFrame};
 use log::info;
 use url::Url;
 
-/// This example demonstrates how to implement explicit timer inside the endpoint. Since endpoint
-/// poll method is called on every cycle by the io service we can implement timer functionality
-/// directly inside the endpoint. In this case, the endpoint will keep disconnecting every 10s.
+/// This example demonstrates how application logic can request a disconnect through an active
+/// endpoint guard. In this case, the endpoint is recreated every 10 seconds.
 struct TradeEndpoint {
     connection_info: ConnectionInfo,
     instrument: &'static str,
-    next_disconnect_time_ns: u64,
 }
 
 impl TradeEndpoint {
-    pub fn new(url: &'static str, instrument: &'static str, ctx: &FeedContext) -> TradeEndpoint {
+    pub fn new(url: &'static str, instrument: &'static str, _ctx: &FeedContext) -> TradeEndpoint {
         let connection_info = Url::parse(url).try_into().unwrap();
         Self {
             connection_info,
             instrument,
-            next_disconnect_time_ns: ctx.current_time_ns() + Duration::from_secs(10).as_nanos() as u64,
         }
     }
 }
 
 #[derive(Debug)]
-struct FeedContext;
+struct FeedContext {
+    next_disconnect_time_ns: u64,
+}
 
 impl Context for FeedContext {}
 
 impl FeedContext {
     pub fn new() -> Self {
-        Self
+        let mut context = Self {
+            next_disconnect_time_ns: 0,
+        };
+        context.next_disconnect_time_ns = context.current_time_ns() + Duration::from_secs(10).as_nanos() as u64;
+        context
     }
 
     pub fn current_time_ns(&self) -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    fn should_disconnect(&mut self) -> bool {
+        let now_ns = self.current_time_ns();
+        if now_ns <= self.next_disconnect_time_ns {
+            return false;
+        }
+        self.next_disconnect_time_ns = now_ns + Duration::from_secs(10).as_nanos() as u64;
+        true
     }
 }
 
@@ -55,7 +67,6 @@ impl ConnectionInfoProvider for TradeEndpoint {
 
 impl EndpointWithContext<FeedContext> for TradeEndpoint {
     type Target = Websocket<TlsStream<MioStream>>;
-    type Event<'a> = Batch<'a, TlsStream<MioStream>>;
 
     fn create_target(&mut self, addr: SocketAddr, _ctx: &mut FeedContext) -> io::Result<Option<Self::Target>> {
         let mut ws = self
@@ -72,19 +83,6 @@ impl EndpointWithContext<FeedContext> for TradeEndpoint {
 
         Ok(Some(ws))
     }
-
-    fn poll<'a>(
-        &'a mut self,
-        ws: &'a mut Self::Target,
-        ctx: &'a mut FeedContext,
-    ) -> io::Result<Option<Self::Event<'a>>> {
-        let now_ns = ctx.current_time_ns();
-        if now_ns > self.next_disconnect_time_ns {
-            self.next_disconnect_time_ns = now_ns + Duration::from_secs(10).as_nanos() as u64;
-            return Err(io::Error::other("disconnected due to timer"));
-        }
-        Ok(Some(ws.read_batch()?))
-    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -98,10 +96,21 @@ fn main() -> anyhow::Result<()> {
 
     io_service.register(endpoint_btc)?;
     loop {
-        if let IOServiceEvent::Data { event, .. } = io_service.poll(&mut ctx)? {
-            for frame in event {
-                if let WebsocketFrame::Text(fin, data) = frame? {
-                    info!("({fin}) {}", String::from_utf8_lossy(data));
+        for event in io_service.poll(&mut ctx)? {
+            if let IOServiceEvent::Active(active) = event {
+                if ctx.should_disconnect() {
+                    let _ = active.try_with::<()>(|_| Err(io::Error::other("timer expired")));
+                    continue;
+                }
+                let batch = active.try_with(|ws| {
+                    ws.read_batch()
+                        .map(|batch| batch.into_iter().map(|frame| frame.map_err(io::Error::from)))
+                        .map_err(io::Error::from)
+                })?;
+                for frame in batch {
+                    if let WebsocketFrame::Text(fin, data) = frame? {
+                        info!("({fin}) {}", String::from_utf8_lossy(data));
+                    }
                 }
             }
         }

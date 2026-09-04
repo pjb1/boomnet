@@ -4,7 +4,7 @@ use boomnet::service::select::direct::DirectSelector;
 use boomnet::service::{IOServiceEvent, IntoIOService};
 use boomnet::stream::tls::TlsStream;
 use boomnet::stream::{ConnectionInfo, ConnectionInfoProvider, tcp};
-use boomnet::ws::{Batch, IntoTlsWebsocket, Websocket, WebsocketFrame};
+use boomnet::ws::{IntoTlsWebsocket, Websocket, WebsocketFrame};
 use std::io;
 use std::net::SocketAddr;
 use url::Url;
@@ -47,7 +47,6 @@ impl ConnectionInfoProvider for TradeEndpoint {
 
 impl Endpoint for TradeEndpoint {
     type Target = Websocket<TlsStream<tcp::TcpStream>>;
-    type Event<'a> = Batch<'a, TlsStream<tcp::TcpStream>>;
 
     fn create_target(&mut self, addr: SocketAddr) -> io::Result<Option<Self::Target>> {
         let mut ws = self
@@ -61,10 +60,6 @@ impl Endpoint for TradeEndpoint {
         )?;
 
         Ok(Some(ws))
-    }
-
-    fn poll<'a>(&'a mut self, ws: &'a mut Self::Target) -> io::Result<Option<Self::Event<'a>>> {
-        Ok(Some(ws.read_batch()?))
     }
 }
 
@@ -82,10 +77,18 @@ fn main() -> anyhow::Result<()> {
     io_service.register(endpoint_xrp)?;
 
     loop {
-        if let IOServiceEvent::Data { handle, event } = io_service.poll()? {
-            for frame in event {
-                if let WebsocketFrame::Text(fin, data) = frame? {
-                    println!("[{handle:?}] ({fin}) {}", String::from_utf8_lossy(data));
+        for event in io_service.poll()? {
+            if let IOServiceEvent::Active(active) = event {
+                let handle = active.handle();
+                let batch = active.try_with(|ws| {
+                    ws.read_batch()
+                        .map(|batch| batch.into_iter().map(|frame| frame.map_err(io::Error::from)))
+                        .map_err(io::Error::from)
+                })?;
+                for frame in batch {
+                    if let WebsocketFrame::Text(fin, data) = frame? {
+                        println!("[{handle:?}] ({fin}) {}", String::from_utf8_lossy(data));
+                    }
                 }
             }
         }

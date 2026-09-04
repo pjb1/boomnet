@@ -1,4 +1,5 @@
 use crate::service::Handle;
+use crate::service::endpoint::DisconnectReason;
 use crate::service::select::SelectorToken;
 use crate::service::time::TimeSource;
 use std::time::Duration;
@@ -8,13 +9,12 @@ pub struct IONode<S, E> {
     pub endpoint: (Handle, E),
     pub ttl: Duration,
     pub disconnect_time_ns: u64,
+    pub pending_disconnect: Option<DisconnectReason>,
 }
 
 /// Token-indexed storage for active I/O nodes.
 pub struct IONodes<S, E> {
     slots: Vec<Option<IONode<S, E>>>,
-    next_poll_index: usize,
-    active_count: usize,
 }
 
 const MIN_IO_NODE_SLOTS: usize = 4;
@@ -22,9 +22,7 @@ const MIN_IO_NODE_SLOTS: usize = 4;
 impl<S, E> Default for IONodes<S, E> {
     fn default() -> Self {
         Self {
-            slots: std::iter::repeat_with(|| None).take(MIN_IO_NODE_SLOTS).collect(),
-            next_poll_index: 0,
-            active_count: 0,
+            slots: Vec::with_capacity(MIN_IO_NODE_SLOTS),
         }
     }
 }
@@ -33,15 +31,13 @@ impl<S, E> IONodes<S, E> {
     pub fn insert(&mut self, token: SelectorToken, node: IONode<S, E>) -> Result<(), IONode<S, E>> {
         let index = token as usize;
         if index >= self.slots.len() {
-            let new_len = (index + 1).next_power_of_two().max(MIN_IO_NODE_SLOTS);
-            self.slots.resize_with(new_len, || None);
+            self.slots.resize_with(index + 1, || None);
         }
         let slot = &mut self.slots[index];
         if slot.is_some() {
             return Err(node);
         }
         *slot = Some(node);
-        self.active_count += 1;
         Ok(())
     }
 
@@ -57,17 +53,9 @@ impl<S, E> IONodes<S, E> {
 
     pub fn remove(&mut self, token: SelectorToken) -> Option<IONode<S, E>> {
         let node = self.slots.get_mut(token as usize)?.take()?;
-        self.active_count -= 1;
-        let required_len = self
-            .slots
-            .iter()
-            .rposition(Option::is_some)
-            .map_or(0, |index| index + 1);
-        let new_len = required_len.next_power_of_two().max(MIN_IO_NODE_SLOTS);
-        if new_len < self.slots.len() {
-            self.slots.truncate(new_len);
+        while self.slots.last().is_some_and(Option::is_none) {
+            self.slots.pop();
         }
-        self.next_poll_index &= self.slots.len() - 1;
         Some(node)
     }
 
@@ -82,19 +70,8 @@ impl<S, E> IONodes<S, E> {
     }
 
     #[inline]
-    pub fn next_active_token(&mut self) -> Option<SelectorToken> {
-        if self.active_count == 0 {
-            return None;
-        }
-
-        for _ in 0..self.slots.len() {
-            let index = self.next_poll_index;
-            self.next_poll_index = (index + 1) & (self.slots.len() - 1);
-            if self.slots[index].is_some() {
-                return Some(index as SelectorToken);
-            }
-        }
-        None
+    pub fn slots_mut(&mut self) -> std::slice::IterMut<'_, Option<IONode<S, E>>> {
+        self.slots.iter_mut()
     }
 }
 
@@ -109,6 +86,7 @@ impl<S, E> IONode<S, E> {
             endpoint: (handle, endpoint),
             ttl: Duration::from_nanos(ttl),
             disconnect_time_ns: ts.current_time_nanos().saturating_add(ttl),
+            pending_disconnect: None,
         }
     }
 
@@ -161,19 +139,17 @@ mod tests {
     }
 
     #[test]
-    fn storage_size_remains_a_power_of_two() {
+    fn storage_is_token_indexed_and_compacts_trailing_holes() {
         let mut nodes = IONodes::<(), ()>::default();
-        assert_eq!(nodes.slots.len(), MIN_IO_NODE_SLOTS);
+        assert_eq!(nodes.slots.len(), 0);
+        assert_eq!(nodes.slots.capacity(), MIN_IO_NODE_SLOTS);
 
         let node = IONode::new((), Handle(4), (), None, &FixedTime);
         assert!(nodes.insert(4, node).is_ok());
-        assert_eq!(nodes.slots.len(), 8);
-        assert_eq!(nodes.next_active_token(), Some(4));
-        assert_eq!(nodes.next_active_token(), Some(4));
+        assert_eq!(nodes.slots.len(), 5);
+        assert!(nodes.get(4).is_some());
 
         assert!(nodes.remove(4).is_some());
-        assert_eq!(nodes.slots.len(), MIN_IO_NODE_SLOTS);
-        assert!(nodes.slots.len().is_power_of_two());
-        assert_eq!(nodes.next_active_token(), None);
+        assert_eq!(nodes.slots.len(), 0);
     }
 }
