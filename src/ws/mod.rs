@@ -259,15 +259,21 @@ impl<S: Read + Write> Websocket<S> {
     }
 
     #[inline]
-    fn send(&mut self, fin: bool, op_code: u8, body: Option<&[u8]>) -> Result<(), Error> {
+    fn send_with_opt(&mut self, fin: bool, op_code: u8, body: Option<&[u8]>, flush: bool) -> Result<(), Error> {
+        // TODO: Should probably make a stuct for options.
         self.ensure_not_closed()?;
-        match self.state.send(&mut self.stream, fin, op_code, body) {
+        match self.state.send(&mut self.stream, fin, op_code, body, flush) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.closed = true;
-                Err(err)?
+                return Err(err)?;
             }
         }
+    }
+
+    #[inline]
+    fn send(&mut self, fin: bool, op_code: u8, body: Option<&[u8]>) -> Result<(), Error> {
+        self.send_with_opt(fin, op_code, body, true)
     }
 
     #[inline]
@@ -276,6 +282,105 @@ impl<S: Read + Write> Websocket<S> {
             return Err(Closed);
         }
         Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        Ok(self.stream.flush()?)
+    }
+    /// Writes multiple calls into the buffer before flushing
+    /// Any send_* can return an error, one variant is that the beffer is full, and its the callers
+    /// decision on how to handle.
+    /// Once all data is ready call finialize to fluck to socket.
+    /// Implements Drop which is a best effort call to push, if there is an error, it is only logged.
+    /// ```no_run
+    ///
+    /// use std::net::TcpStream;
+    /// use boomnet::stream::{BindAndConnect, ConnectionInfo};
+    /// use boomnet::stream::buffer::IntoBufferedStream;
+    /// use boomnet::stream::tls::IntoTlsStream;
+    /// use boomnet::ws::IntoWebsocket;
+    ///
+    /// let mut ws = ConnectionInfo::new("stream.binance.com", 9443)
+    /// .into_tcp_stream().unwrap()
+    /// .into_tls_stream().unwrap()
+    /// .into_default_buffered_stream()
+    /// .into_websocket("/ws");
+    ///
+    /// let mut writer = ws.writer();
+    ///
+    /// writer.send_text("hello")?;
+    /// writer.send_text("world")?;
+    ///
+    /// match writer.send_text("not enough buffer") {
+    ///     Ok(_) => {}
+    ///     Err(_) if e.kind == ErrorKind::WriteZero {
+    ///         // Buffer does not have enough capacity
+    ///         writer.flush()?;
+    ///
+    ///         writer.send_text("not enough buffer").expect("handle this")
+    ///     }
+    ///     Err(_) => {
+    ///         // Connection may no longer be valid.
+    ///
+    ///     }
+    /// }
+    ///
+    /// writer.finialize()?;
+    ///
+    /// ```
+    pub fn writer<'a>(&'a mut self) -> MultiWrite<'a, S> {
+        MultiWrite { ws: self }
+    }
+}
+
+pub struct MultiWrite<'a, S: Read + Write> {
+    ws: &'a mut Websocket<S>,
+}
+
+// TODO FIXME: Pull out as to not break existing API right now.
+impl<'a, S: Read + Write> MultiWrite<'a, S> {
+    #[inline]
+    pub fn finialize(self) -> Result<(), Error> {
+        self.ws.flush()
+    }
+
+    #[inline]
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.ws.flush()
+    }
+
+    #[inline]
+    pub fn send_text(&mut self, fin: bool, body: Option<&[u8]>) -> Result<(), Error> {
+        self.ws.send_with_opt(fin, protocol::op::TEXT_FRAME, body, false)
+    }
+    #[inline]
+    pub fn send_binary(&mut self, fin: bool, body: Option<&[u8]>) -> Result<(), Error> {
+        self.ws.send_with_opt(fin, protocol::op::BINARY_FRAME, body, false)
+    }
+
+    #[inline]
+    pub fn send_pong(&mut self, body: Option<&[u8]>) -> Result<(), Error> {
+        self.ws.send_with_opt(true, protocol::op::PONG, body, false)
+    }
+
+    #[inline]
+    pub fn send_ping(&mut self, body: Option<&[u8]>) -> Result<(), Error> {
+        self.ws.send_with_opt(true, protocol::op::PING, body, false)
+    }
+
+    #[inline]
+    pub fn send_close(mut self) -> Result<(), Error> {
+        self.ws
+            .send_with_opt(true, protocol::op::CONNECTION_CLOSE, None, false)?;
+        self.flush()
+    }
+}
+
+impl<'a, S: Read + Write> std::ops::Drop for MultiWrite<'a, S> {
+    fn drop(&mut self) {
+        if let Err(e) = self.ws.flush() {
+            log::error!("Drop failed to flush with {:?}", e);
+        }
     }
 }
 
@@ -355,11 +460,11 @@ impl State {
             },
             State::Connection(decoder) => match decoder.decode_next() {
                 Ok(Some(WebsocketFrame::Ping(payload))) => {
-                    self.send(stream, true, protocol::op::PONG, Some(payload))?;
+                    self.send(stream, true, protocol::op::PONG, Some(payload), true)?;
                     Ok(None)
                 }
                 Ok(Some(WebsocketFrame::Close(payload))) => {
-                    let _ = self.send(stream, true, protocol::op::CONNECTION_CLOSE, Some(payload));
+                    let _ = self.send(stream, true, protocol::op::CONNECTION_CLOSE, Some(payload), true);
                     let (status_code, body) = payload.split_at(std::mem::size_of::<u16>());
                     let status_code = u16::from_be_bytes(status_code.try_into()?);
                     let body = String::from_utf8_lossy(body).to_string();
@@ -372,14 +477,21 @@ impl State {
     }
 
     #[inline]
-    fn send<S: Write>(&mut self, stream: &mut S, fin: bool, op_code: u8, body: Option<&[u8]>) -> Result<(), Error> {
+    fn send<S: Write>(
+        &mut self,
+        stream: &mut S,
+        fin: bool,
+        op_code: u8,
+        body: Option<&[u8]>,
+        flush: bool,
+    ) -> Result<(), Error> {
         match self {
             State::Handshake(handshake, _) => {
                 handshake.buffer_message(fin, op_code, body);
                 Ok(())
             }
             State::Connection(_) => {
-                encoder::send(stream, fin, op_code, body)?;
+                encoder::send(stream, fin, op_code, body, flush)?;
                 Ok(())
             }
         }

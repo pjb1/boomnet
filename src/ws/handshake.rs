@@ -101,10 +101,10 @@ impl Handshaker {
     pub fn drain_pending_message_buffer<S, F>(&mut self, stream: &mut S, mut send: F) -> Result<(), Error>
     where
         S: Write,
-        F: FnMut(&mut S, bool, u8, Option<&[u8]>) -> io::Result<()>,
+        F: FnMut(&mut S, bool, u8, Option<&[u8]>, bool) -> io::Result<()>,
     {
         while let Some((op, fin, body)) = self.pending_msg_buffer.pop_front() {
-            send(stream, fin, op, body.as_deref())?;
+            send(stream, fin, op, body.as_deref(), true)?;
         }
         Ok(())
     }

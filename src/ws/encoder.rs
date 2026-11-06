@@ -4,7 +4,7 @@ use std::io::Write;
 use crate::ws::protocol;
 
 #[inline]
-pub fn send<S: Write>(stream: &mut S, fin: bool, op_code: u8, body: Option<&[u8]>) -> io::Result<()> {
+pub fn send<S: Write>(stream: &mut S, fin: bool, op_code: u8, body: Option<&[u8]>, flush: bool) -> io::Result<()> {
     let mut header = 0u8;
     if fin {
         header |= protocol::FIN_MASK;
@@ -39,6 +39,8 @@ pub fn send<S: Write>(stream: &mut S, fin: bool, op_code: u8, body: Option<&[u8]
         // this is done for performance reason as it will make XOR no-op
         stream.write_all(body)?;
     }
-    stream.flush()?;
+    if flush {
+        stream.flush()?;
+    }
     Ok(())
 }
