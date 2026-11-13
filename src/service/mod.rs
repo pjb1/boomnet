@@ -639,9 +639,9 @@ where
     /// endpoint is active and has no pending disconnect, `Ok(Some(...))` will be returned and the
     /// provided `action` invoked. Otherwise this method returns `Ok(None)` without invoking `action`.
     /// The action receives the live endpoint and its factory, and can capture application context directly.
-    pub fn dispatch<A, T>(&mut self, handle: Handle, mut action: A) -> io::Result<Option<T>>
+    pub fn dispatch<A, T>(&mut self, handle: Handle, action: A) -> io::Result<Option<T>>
     where
-        A: FnMut(&mut F::Endpoint, &mut F) -> std::io::Result<T>,
+        A: FnOnce(&mut F::Endpoint, &mut F) -> std::io::Result<T>,
     {
         let Some(registration) = self.registrations.get_mut(handle) else {
             return Ok(None);
