@@ -3,7 +3,7 @@
 use crate::service::select::Selectable;
 use crate::stream::{ConnectionInfo, ConnectionInfoProvider, ReadHint};
 #[cfg(feature = "mio")]
-use mio::{Interest, Registry, Token, event::Source};
+use mio::{event::Source, Interest, Registry, Token};
 use std::io;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::MaybeUninit;
@@ -21,7 +21,11 @@ pub const DEFAULT_BUFFER_SIZE: usize = 1024;
 ///
 /// Wrap with default BufferedStream`.
 ///
-/// ``` no_run
+#[cfg_attr(all(feature = "ws", any(feature = "openssl", feature = "ktls")), doc = "```no_run")]
+#[cfg_attr(
+    not(all(feature = "ws", any(feature = "openssl", feature = "ktls"))),
+    doc = "```ignore"
+)]
 /// use boomnet::stream::buffer::IntoBufferedStream;
 /// use boomnet::stream::ConnectionInfo;
 /// use boomnet::stream::tls::IntoTlsStream;
@@ -36,7 +40,11 @@ pub const DEFAULT_BUFFER_SIZE: usize = 1024;
 ///
 /// Specify buffer size when wrapping.
 ///
-/// ``` no_run
+#[cfg_attr(all(feature = "ws", any(feature = "openssl", feature = "ktls")), doc = "```no_run")]
+#[cfg_attr(
+    not(all(feature = "ws", any(feature = "openssl", feature = "ktls"))),
+    doc = "```ignore"
+)]
 /// use boomnet::stream::buffer::IntoBufferedStream;
 /// use boomnet::stream::ConnectionInfo;
 /// use boomnet::stream::tls::IntoTlsStream;

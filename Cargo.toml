@@ -90,6 +90,83 @@ name = "latency"
 path = "benches/latency/main.rs"
 harness = false
 
+[[test]]
+name = "select"
+path = "test/select.rs"
+required-features = ["mio", "io_uring"]
+
 [[example]]
 name = "io_service_with_io_uring_selector"
 required-features = ["io-uring", "openssl", "ws"]
+
+[[example]]
+name = "endpoint_with_timer"
+required-features = ["mio", "openssl", "ws"]
+
+[[example]]
+name = "http_single_connection"
+required-features = ["openssl", "http"]
+
+[[example]]
+name = "io_service_dispatch"
+required-features = ["mio", "openssl", "ws"]
+
+[[example]]
+name = "io_service_event_adapter"
+required-features = ["mio", "openssl", "ws"]
+
+[[example]]
+name = "io_service_ktls"
+required-features = ["klts", "ws", "mio"]
+
+[[example]]
+name = "io_service_with_async_dns"
+required-features = ["openssl", "mio", "ws"]
+
+[[example]]
+name = "io_service_with_auto_disconnect"
+required-features = ["openssl", "mio", "ws"]
+
+[[example]]
+name = "io_service_with_cares_dns"
+required-features = ["openssl", "mio", "ws", "c-ares"]
+
+[[example]]
+name = "io_service_with_context"
+required-features = ["openssl", "mio", "ws"]
+
+[[example]]
+name = "io_service_with_direct_selector"
+required-features = ["openssl", "ws"]
+
+[[example]]
+name = "io_service_without_context"
+required-features = ["openssl", "mio", "ws"]
+
+[[example]]
+name = "ping"
+required-features = ["openssl", "ws"]
+
+[[example]]
+name = "polymorphic_endpoints"
+required-features = ["openssl", "mio", "ws"]
+
+[[example]]
+name = "recorded_stream"
+required-features = ["openssl", "ws"]
+
+[[example]]
+name = "replay_stream"
+required-features = ["openssl", "ws"]
+
+[[example]]
+name = "ws_client"
+required-features = ["openssl", "ws"]
+
+[[example]]
+name = "ws_client_blocking"
+required-features = ["openssl", "ws"]
+
+[[example]]
+name = "ws_client_ktls"
+required-features = ["ktls", "ws"]
